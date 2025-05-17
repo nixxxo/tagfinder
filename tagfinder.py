@@ -8,6 +8,8 @@ import sys
 import time
 from typing import Dict, List, Optional, Set, Tuple
 from collections import deque
+import select
+import struct
 
 import bleak
 from bleak import BleakScanner, BleakClient
@@ -23,11 +25,76 @@ from rich import box
 # Constants
 SETTINGS_FILE = "settings.json"
 HISTORY_FILE = "devices_history.json"
-AIRTAG_IDENTIFIERS = ["apple", "airtag", "find"]  # Identifiers to detect AirTags
+AIRTAG_IDENTIFIERS = [
+    "apple",
+    "airtag",
+    "find my",
+    "locate",
+]  # Identifiers to detect AirTags
+FIND_MY_UUIDS = ["7DFC9000", "7DFC9001", "FD44", "05AC"]  # Apple Find My related UUIDs
 SCAN_INTERVAL = 1.0  # Scan interval in seconds
 DEFAULT_RSSI_AT_ONE_METER = -59  # Default RSSI at 1 meter for Bluetooth LE
 DEFAULT_DISTANCE_N_VALUE = 2.0  # Default environmental factor for distance calculation
 RSSI_HISTORY_SIZE = 10  # Number of RSSI readings to keep for smoothing
+
+# Company identifiers (Bluetooth SIG assigned numbers)
+COMPANY_IDENTIFIERS = {
+    0x004C: "Apple",
+    0x0006: "Microsoft",
+    0x000F: "Broadcom",
+    0x0075: "Samsung",
+    0x00E0: "Google",
+    0x00D2: "Sony",
+    0x0499: "Ruuvi Innovations",
+    0x0059: "Nordic Semiconductor",
+    0x0001: "Ericsson",
+    0x0002: "Intel",
+    0x00E0: "Google",
+    0x0087: "Garmin",
+    0x0157: "Anhui Huami",
+    0x038F: "Xiaomi",
+    0x02D0: "Tile",
+}
+
+# Device types based on services or characteristics
+DEVICE_TYPES = {
+    "FE9F": "Apple Continuity",
+    "180F": "Battery Service",
+    "1812": "HID (Human Interface Device)",
+    "180A": "Device Information",
+    "1800": "Generic Access",
+    "1801": "Generic Attribute",
+    "1802": "Immediate Alert",
+    "1803": "Link Loss",
+    "1804": "Tx Power",
+    "1805": "Current Time",
+    "180D": "Heart Rate",
+    "1813": "Scan Parameters",
+    "1819": "Location and Navigation",
+    "181C": "User Data",
+    "181D": "Weight Scale",
+    "181E": "Bond Management",
+    "181F": "Continuous Glucose Monitoring",
+    "1826": "Fitness Machine",
+    "1827": "Mesh Provisioning",
+    "1828": "Mesh Proxy",
+    "183A": "Environmental Sensing",
+    "181A": "Environmental Sensing",
+}
+
+# Apple specific service flags for device type identification
+APPLE_DEVICE_TYPES = {
+    0x01: "iMac",
+    0x02: "MacBook",
+    0x03: "iPhone",
+    0x04: "iPad",
+    0x05: "Apple Watch",
+    0x06: "Apple TV",
+    0x07: "iPod",
+    0x08: "HomePod",
+    0x09: "AirPods",
+    0x0A: "AirTag",
+}
 
 
 class Device:
@@ -37,36 +104,282 @@ class Device:
         name: str,
         rssi: int,
         manufacturer_data: Optional[Dict] = None,
+        service_data: Optional[Dict] = None,
+        service_uuids: Optional[List] = None,
     ):
         self.address = address
         self.name = name or "Unknown"
         self.rssi = rssi
         self.rssi_history = deque([rssi], maxlen=RSSI_HISTORY_SIZE)
         self.manufacturer_data = manufacturer_data or {}
+        self.service_data = service_data or {}
+        self.service_uuids = service_uuids or []
         self.first_seen = time.time()
         self.last_seen = time.time()
         self.is_airtag = self._check_if_airtag()
         self.calibrated_n_value = DEFAULT_DISTANCE_N_VALUE
         self.calibrated_rssi_at_one_meter = DEFAULT_RSSI_AT_ONE_METER
 
-    def update(self, rssi: int, manufacturer_data: Optional[Dict] = None):
+        # Extract extended information
+        self.manufacturer = self._extract_manufacturer()
+        self.device_type = self._extract_device_type()
+        self.device_details = self._extract_detailed_info()
+
+    def update(
+        self,
+        rssi: int,
+        manufacturer_data: Optional[Dict] = None,
+        service_data: Optional[Dict] = None,
+        service_uuids: Optional[List] = None,
+    ):
         self.rssi = rssi
         self.rssi_history.append(rssi)
         if manufacturer_data:
             self.manufacturer_data = manufacturer_data
+        if service_data:
+            self.service_data = service_data
+        if service_uuids:
+            self.service_uuids = service_uuids
         self.last_seen = time.time()
+
+        # Update extracted information
+        self.manufacturer = self._extract_manufacturer()
+        self.device_type = self._extract_device_type()
+        self.device_details = self._extract_detailed_info()
+
+    def _extract_manufacturer(self) -> str:
+        """Extract manufacturer information from BLE advertisement data"""
+        for company_id in self.manufacturer_data:
+            if company_id in COMPANY_IDENTIFIERS:
+                return COMPANY_IDENTIFIERS[company_id]
+
+        # Try to guess from name or address
+        if self.name:
+            name_lower = self.name.lower()
+            for keyword, company in [
+                ("apple", "Apple"),
+                ("iphone", "Apple"),
+                ("ipad", "Apple"),
+                ("macbook", "Apple"),
+                ("imac", "Apple"),
+                ("watch", "Apple"),
+                ("airtag", "Apple"),
+                ("airpod", "Apple"),
+                ("samsung", "Samsung"),
+                ("galaxy", "Samsung"),
+                ("xiaomi", "Xiaomi"),
+                ("mi ", "Xiaomi"),
+                ("huawei", "Huawei"),
+                ("sony", "Sony"),
+                ("bose", "Bose"),
+                ("beats", "Apple/Beats"),
+                ("fitbit", "Fitbit"),
+                ("garmin", "Garmin"),
+                ("tile", "Tile"),
+                ("polar", "Polar"),
+                ("jbl", "JBL"),
+                ("lg", "LG"),
+                ("oneplus", "OnePlus"),
+                ("oppo", "OPPO"),
+                ("vivo", "Vivo"),
+            ]:
+                if keyword in name_lower:
+                    return company
+
+        # Check MAC address OUI (first three bytes)
+        if ":" in self.address:
+            oui = self.address.split(":")[:3]
+            # OUI matching could be implemented with a database
+            # This is a simplified example
+            oui_str = "".join(oui).upper()
+            if oui_str.startswith("AC"):
+                return "Apple"
+            elif oui_str.startswith("00:0D:4B"):
+                return "Roku"
+            elif oui_str.startswith("00:1A:11"):
+                return "Google"
+
+        return "Unknown"
+
+    def _extract_device_type(self) -> str:
+        """Extract device type from BLE advertisement data"""
+        device_type = "BLE Device"
+
+        # Check for Apple device type flag in manufacturer data
+        if 76 in self.manufacturer_data and len(self.manufacturer_data[76]) > 2:
+            apple_type_byte = self.manufacturer_data[76][2] & 0x0F
+            if apple_type_byte in APPLE_DEVICE_TYPES:
+                device_type = APPLE_DEVICE_TYPES[apple_type_byte]
+
+        # Check the name for more specific information
+        if self.name:
+            name_lower = self.name.lower()
+
+            # Prioritize name over manufacturer data for Apple devices
+            if "iphone" in name_lower:
+                return "iPhone"
+            elif "ipad" in name_lower:
+                return "iPad"
+            elif "macbook" in name_lower or "mac book" in name_lower:
+                return "MacBook"
+            elif "imac" in name_lower:
+                return "iMac"
+            elif (
+                "apple watch" in name_lower
+                or "watch" in name_lower
+                and self.manufacturer == "Apple"
+            ):
+                return "Apple Watch"
+            elif "airpod" in name_lower:
+                return "AirPods"
+            elif "airtag" in name_lower:
+                return "AirTag"
+
+            # Non-Apple devices
+            elif "watch" in name_lower:
+                return "Smartwatch"
+            elif (
+                "headphone" in name_lower
+                or "earphone" in name_lower
+                or "earbud" in name_lower
+            ):
+                return "Headphones"
+            elif "speaker" in name_lower:
+                return "Speaker"
+            elif "tag" in name_lower or "tracker" in name_lower:
+                return "Tracker"
+            elif "tv" in name_lower:
+                return "TV"
+            elif "remote" in name_lower:
+                return "Remote Control"
+            elif "keyboard" in name_lower:
+                return "Keyboard"
+            elif "mouse" in name_lower:
+                return "Mouse"
+            elif "car" in name_lower or "auto" in name_lower:
+                return "Car Accessory"
+            elif "phone" in name_lower:
+                return "Phone"
+            elif "pad" in name_lower or "tablet" in name_lower:
+                return "Tablet"
+
+        # Keep the Apple device type from manufacturer data if we didn't find a better match
+        return device_type
+
+    def _extract_detailed_info(self) -> str:
+        """Extract detailed information from BLE advertisement data"""
+        details = []
+
+        # Add MAC address short form
+        if ":" in self.address:
+            mac_parts = self.address.split(":")
+            details.append(f"MAC: {':'.join(mac_parts[-3:])}")
+
+        # Signal stability
+        stability = self.signal_stability
+        if stability < 2.0:
+            details.append(f"Signal: Stable({stability:.1f})")
+        elif stability < 5.0:
+            details.append(f"Signal: Moderate({stability:.1f})")
+        else:
+            details.append(f"Signal: Unstable({stability:.1f})")
+
+        # Parse Apple specific data
+        if 76 in self.manufacturer_data:
+            apple_data = self.manufacturer_data[76]
+
+            # Try to extract Apple model details
+            if len(apple_data) > 5:
+                try:
+                    # AirTag and Find My protocol specifics
+                    if apple_data[0] == 0x12 and apple_data[1] == 0x19:
+                        details.append("Find My Network")
+
+                    # AirPods battery levels
+                    elif len(apple_data) >= 13 and (
+                        apple_data[0] == 0x07 or apple_data[0] == 0x01
+                    ):
+                        if apple_data[1] == 0x19:
+                            left_battery = apple_data[6] & 0x0F
+                            right_battery = (apple_data[6] & 0xF0) >> 4
+                            case_battery = apple_data[7] & 0x0F
+                            if left_battery < 0x0F and right_battery < 0x0F:
+                                details.append(
+                                    f"L:{left_battery*10}% R:{right_battery*10}% C:{case_battery*10}%"
+                                )
+                except:
+                    pass
+
+        # Extract service data details
+        for uuid, data in self.service_data.items():
+            if "1809" in uuid.upper():  # Health Thermometer
+                try:
+                    if len(data) >= 2:
+                        temp = struct.unpack("<h", data[:2])[0] / 100.0
+                        details.append(f"Temp: {temp}°C")
+                except:
+                    pass
+
+            elif "2A6D" in uuid.upper() or "2A6E" in uuid.upper():  # Pressure
+                try:
+                    if len(data) >= 4:
+                        pressure = struct.unpack("<f", data[:4])[0]
+                        details.append(f"Pressure: {pressure} Pa")
+                except:
+                    pass
+
+        # Add service UUIDs if present
+        if self.service_uuids and len(self.service_uuids) > 0:
+            known_services = []
+            for uuid in self.service_uuids:
+                uuid_short = uuid[-4:].upper()
+                if uuid_short in DEVICE_TYPES:
+                    known_services.append(DEVICE_TYPES[uuid_short])
+
+            if known_services:
+                services_str = ", ".join(
+                    known_services[:2]
+                )  # Limit to first 2 services
+                if len(known_services) > 2:
+                    services_str += f" +{len(known_services)-2}"
+                details.append(f"Services: {services_str}")
+
+        # Make string from details
+        if details:
+            return " | ".join(details)
+        return ""
 
     def _check_if_airtag(self) -> bool:
         """Check if device is potentially an AirTag or Find My device"""
+        # Check name
         if self.name and any(
             identifier in self.name.lower() for identifier in AIRTAG_IDENTIFIERS
         ):
             return True
+
         # Check manufacturer data for Apple identifiers
-        for key, value in self.manufacturer_data.items():
-            # Apple's company identifier is 0x004C
-            if key == 76:  # 0x004C in decimal
-                return True
+        if (
+            76 in self.manufacturer_data
+        ):  # Apple's company identifier is 0x004C (76 decimal)
+            # Check for AirTag specific patterns in the data
+            data = self.manufacturer_data[76]
+
+            # AirTag specific pattern checking
+            if len(data) > 2:
+                # Find My network typically has these patterns
+                if (data[0] == 0x12 and data[1] == 0x19) or (data[0] == 0x10):
+                    return True
+
+                # Check for AirTag type identifier
+                if len(data) > 3 and data[2] & 0x0F == 0x0A:  # AirTag type is 0x0A
+                    return True
+
+        # Check service UUIDs for Find My related services
+        for uuid in self.service_uuids:
+            for find_my_id in FIND_MY_UUIDS:
+                if find_my_id in uuid.upper():
+                    return True
+
         return False
 
     @property
@@ -127,12 +440,17 @@ class Device:
             "manufacturer_data": {
                 str(k): list(v) for k, v in self.manufacturer_data.items()
             },
+            "service_data": {k: list(v) for k, v in self.service_data.items()},
+            "service_uuids": self.service_uuids,
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "is_airtag": self.is_airtag,
             "distance": self.distance,
             "calibrated_n_value": self.calibrated_n_value,
             "calibrated_rssi_at_one_meter": self.calibrated_rssi_at_one_meter,
+            "manufacturer": self.manufacturer,
+            "device_type": self.device_type,
+            "device_details": self.device_details,
         }
 
     @classmethod
@@ -145,6 +463,8 @@ class Device:
             manufacturer_data={
                 int(k): bytes(v) for k, v in data.get("manufacturer_data", {}).items()
             },
+            service_data={k: bytes(v) for k, v in data.get("service_data", {}).items()},
+            service_uuids=data.get("service_uuids", []),
         )
         device.first_seen = data["first_seen"]
         device.last_seen = data["last_seen"]
@@ -166,8 +486,9 @@ class TagFinder:
         self.airtag_only_mode = self.settings.get("airtag_only_mode", False)
         self.selected_device = None
         self.adaptive_mode = self.settings.get("adaptive_mode", True)
-        self.calibration_mode = False
+        self.calibration_mode = self.settings.get("calibration_mode", False)
         self.layout = self._create_layout()
+        self.device_map = {}  # Map index to device address for selection
 
     def _create_layout(self) -> Layout:
         """Create the layout for the UI"""
@@ -211,16 +532,101 @@ class TagFinder:
     def _save_history(self):
         """Save device history to JSON file"""
         # Convert current devices to dict and add to history
+        current_devices_data = []
         for device in self.devices.values():
-            self.history.append(device.to_dict())
-        # Save to file
+            current_devices_data.append(device.to_dict())
+
+        # Add to history
+        self.history.extend(current_devices_data)
+
+        # Save to file - ensure we're not duplicating entries
+        unique_entries = {}
+        for entry in self.history:
+            address = entry["address"]
+            timestamp = entry["last_seen"]
+            key = f"{address}_{timestamp}"
+            unique_entries[key] = entry
+
+        # Save only unique entries
         with open(HISTORY_FILE, "w") as f:
-            json.dump(self.history, f, indent=2)
+            json.dump(list(unique_entries.values()), f, indent=2)
+
+        self.console.print(
+            f"[green]Saved {len(current_devices_data)} devices to history[/]"
+        )
 
     async def list_adapters(self):
         """List all available Bluetooth adapters"""
-        adapters = await BleakScanner.get_bluetooth_adapters()
+        # Different methods for different platforms
+        adapters = []
 
+        try:
+            if sys.platform == "darwin":  # macOS
+                # On macOS, we can use system_profiler
+                import subprocess
+
+                result = subprocess.run(
+                    ["system_profiler", "SPBluetoothDataType"],
+                    capture_output=True,
+                    text=True,
+                )
+                output = result.stdout
+
+                # Parse the output for Bluetooth controller info
+                if "Bluetooth Controller" in output:
+                    controller_section = output.split("Bluetooth Controller")[1].split(
+                        "\n\n"
+                    )[0]
+                    address = None
+                    name = "Apple Bluetooth"
+
+                    if "Address:" in controller_section:
+                        address_line = [
+                            l for l in controller_section.split("\n") if "Address:" in l
+                        ]
+                        if address_line:
+                            address = address_line[0].split("Address:")[1].strip()
+
+                    adapters.append({"address": address, "name": name})
+
+            elif sys.platform == "linux":
+                # On Linux, we can use hcitool
+                import subprocess
+
+                result = subprocess.run(
+                    ["hcitool", "dev"], capture_output=True, text=True
+                )
+                output = result.stdout
+
+                for line in output.split("\n"):
+                    if "hci" in line:
+                        parts = line.strip().split("\t")
+                        if len(parts) >= 3:
+                            adapters.append(
+                                {
+                                    "address": parts[2],
+                                    "name": f"Bluetooth Adapter ({parts[1]})",
+                                }
+                            )
+
+            elif sys.platform == "win32":
+                # On Windows, we can use Bleak's internal API
+                from bleak.backends.winrt.scanner import BleakScannerWinRT
+
+                scanner = BleakScannerWinRT()
+                await scanner._ensure_adapter()
+                adapters.append(
+                    {"address": "default", "name": "Windows Bluetooth Adapter"}
+                )
+
+        except Exception as e:
+            self.console.print(f"[bold yellow]Error listing adapters: {e}[/]")
+
+        # If no adapters found, add a default one
+        if not adapters:
+            adapters.append({"address": "default", "name": "Default Bluetooth Adapter"})
+
+        # Display adapters table
         table = Table(title="Available Bluetooth Adapters", box=box.ROUNDED)
         table.add_column("Index", style="cyan")
         table.add_column("Address", style="green")
@@ -228,9 +634,13 @@ class TagFinder:
 
         for i, adapter in enumerate(adapters):
             is_current = (
-                "[bold green]⟹[/]" if adapter.address == self.current_adapter else ""
+                "[bold green]⟹[/]" if adapter["address"] == self.current_adapter else ""
             )
-            table.add_row(str(i), adapter.address, f"{adapter.name} {is_current}")
+            table.add_row(
+                str(i),
+                adapter["address"] or "Unknown",
+                f"{adapter['name']} {is_current}",
+            )
 
         self.console.print(table)
 
@@ -238,11 +648,11 @@ class TagFinder:
             "[bold blue]Select adapter index (or Enter to skip): [/]"
         )
         if choice.isdigit() and 0 <= int(choice) < len(adapters):
-            self.current_adapter = adapters[int(choice)].address
+            self.current_adapter = adapters[int(choice)]["address"]
             self.settings["adapter"] = self.current_adapter
             self._save_settings()
             self.console.print(
-                f"[bold green]Selected adapter: {adapters[int(choice)].name}[/]"
+                f"[bold green]Selected adapter: {adapters[int(choice)]['name']}[/]"
             )
 
     def generate_device_table(self, devices: Dict[str, Device]) -> Table:
@@ -254,26 +664,33 @@ class TagFinder:
             title_style="bold cyan",
             border_style="blue",
         )
-        table.add_column("Name", style="cyan")
-        table.add_column("Address", style="dim blue")
-        table.add_column("RSSI (dBm)", justify="right")
-        table.add_column("Distance (m)", justify="right")
-        table.add_column("Stability", justify="right")
-        table.add_column("Type")
-        table.add_column("Seen (s)", justify="right")
+        table.add_column("Name", style="cyan", max_width=18)
+        table.add_column("Type", max_width=12)
+        table.add_column("Manufacturer", max_width=10)
+        table.add_column("RSSI", justify="right", max_width=8)
+        table.add_column("Distance", justify="right", max_width=10)
+        table.add_column("Seen", justify="right", max_width=8)
+        table.add_column("Details", max_width=28)
 
         # Sort devices by RSSI (closest first)
         sorted_devices = sorted(devices.values(), key=lambda d: d.rssi, reverse=True)
+
+        # Use sequential numbers for device selection
+        device_map = {}
+        idx = 0
 
         for device in sorted_devices:
             # Skip non-AirTags if in AirTag only mode
             if self.airtag_only_mode and not device.is_airtag:
                 continue
 
-            device_type = "AirTag/Find My" if device.is_airtag else "Standard BLE"
-            distance = f"{device.distance:.2f}" if device.distance < 100 else "Unknown"
-            duration = f"{device.seen_duration:.1f}"
-            stability = f"{device.signal_stability:.1f}"
+            # Map index to device address for selection
+            device_map[idx] = device.address
+            idx_display = f"[{idx}]" if idx < 10 else f"[{idx:2}]"
+            idx += 1
+
+            distance = f"{device.distance:.2f}m" if device.distance < 100 else "Unknown"
+            seen_time = f"{device.seen_duration:.1f}s"
 
             # Color code RSSI for signal strength
             rssi_str = str(int(device.smooth_rssi))
@@ -290,19 +707,25 @@ class TagFinder:
             # Highlight selected device
             style = "on blue" if device.address == self.selected_device else ""
 
+            # Display detailed information without the seen time
+            details = device.device_details if device.device_details else ""
+
             table.add_row(
-                Text(device.name, style=f"{name_color} {style}"),
-                device.address,
+                Text(f"{idx_display} {device.name}", style=f"{name_color} {style}"),
+                device.device_type,
+                device.manufacturer,
                 Text(rssi_str, style=f"{rssi_color} {style}"),
                 distance,
-                stability,
-                device_type,
-                duration,
+                seen_time,
+                details,
                 style=style,
             )
 
-        if not sorted_devices:
+        if not sorted_devices or idx == 0:
             table.add_row("No devices found", "", "", "", "", "", "")
+
+        # Store the device map for index-based selection
+        self.device_map = device_map
 
         return table
 
@@ -320,47 +743,116 @@ class TagFinder:
         adaptive_mode = "[green]ON[/]" if self.adaptive_mode else "[red]OFF[/]"
         calibration_mode = "[green]ON[/]" if self.calibration_mode else "[red]OFF[/]"
 
-        return Panel(
-            "\n".join(
-                [
-                    "[bold cyan]Controls:[/]",
-                    " [bold blue]s[/] - Start/Stop scanning",
-                    " [bold blue]a[/] - Toggle AirTag only mode",
-                    " [bold blue]d[/] - Toggle adaptive distance mode",
-                    " [bold blue]c[/] - Calibrate selected device",
-                    " [bold blue]l[/] - List Bluetooth adapters",
-                    " [bold blue]z[/] - Summarize findings",
-                    " [bold blue]q[/] - Quit",
-                    "",
-                    f"[bold]Status:[/] {'[green]Scanning[/]' if self.scanning else '[yellow]Idle[/]'}",
-                    f"[bold]AirTag only mode:[/] {airtag_mode}",
-                    f"[bold]Adaptive distance:[/] {adaptive_mode}",
-                    f"[bold]Calibration mode:[/] {calibration_mode}",
-                    f"[bold]Adapter:[/] {self.current_adapter or 'Default'}",
-                ]
-            ),
-            title="[bold blue]TagFinder Controls[/]",
-            border_style="blue",
-            box=ROUNDED,
-        )
+        if self.scanning:
+            # Only show the quit option while scanning
+            return Panel(
+                "\n".join(
+                    [
+                        "[bold cyan]Controls:[/]",
+                        " [bold blue]q[/] - Quit scanning and save",
+                        "",
+                        f"[bold]Status:[/] [green]Scanning[/]",
+                        f"[bold]AirTag only mode:[/] {airtag_mode}",
+                        f"[bold]Adaptive distance:[/] {adaptive_mode}",
+                        f"[bold]Calibration mode:[/] {calibration_mode}",
+                        f"[bold]Adapter:[/] {self.current_adapter or 'Default'}",
+                    ]
+                ),
+                title="[bold blue]TagFinder Controls[/]",
+                border_style="blue",
+                box=ROUNDED,
+            )
+        else:
+            # Show all controls when not scanning
+            return Panel(
+                "\n".join(
+                    [
+                        "[bold cyan]Controls:[/]",
+                        " [bold blue]s[/] - Start/Stop scanning",
+                        " [bold blue]a[/] - Toggle AirTag only mode",
+                        " [bold blue]d[/] - Toggle adaptive distance mode",
+                        " [bold blue]c[/] - Toggle calibration mode",
+                        " [bold blue]l[/] - List Bluetooth adapters",
+                        " [bold blue]z[/] - Summarize findings",
+                        " [bold blue]q[/] - Quit",
+                        "",
+                        f"[bold]Status:[/] [yellow]Idle[/]",
+                        f"[bold]AirTag only mode:[/] {airtag_mode}",
+                        f"[bold]Adaptive distance:[/] {adaptive_mode}",
+                        f"[bold]Calibration mode:[/] {calibration_mode}",
+                        f"[bold]Adapter:[/] {self.current_adapter or 'Default'}",
+                    ]
+                ),
+                title="[bold blue]TagFinder Controls[/]",
+                border_style="blue",
+                box=ROUNDED,
+            )
 
     def generate_device_details(self, device: Device) -> Panel:
         """Generate detailed panel for selected device"""
         if not device:
             return Panel("No device selected", title="Device Details")
 
+        # Extract services information
+        service_info = ""
+        if device.service_uuids:
+            service_info = "\n[bold]Services:[/]"
+            for uuid in device.service_uuids[:10]:  # Limit to 10 services
+                short_uuid = uuid[-4:].upper()
+                service_name = DEVICE_TYPES.get(short_uuid, "Unknown")
+                service_info += f"\n  {short_uuid}: {service_name}"
+
+            if len(device.service_uuids) > 10:
+                service_info += f"\n  ... and {len(device.service_uuids) - 10} more"
+
+        # Extract manufacturer data
         mfg_data = ""
         for key, value in device.manufacturer_data.items():
-            mfg_data += f"\n  {key}: {value.hex()}"
+            company = COMPANY_IDENTIFIERS.get(key, f"Unknown ({key})")
+            mfg_data += f"\n  {company}: {value.hex()}"
+
+        # Prepare battery info if available
+        battery_info = ""
+        if 76 in device.manufacturer_data:
+            apple_data = device.manufacturer_data[76]
+            if len(apple_data) >= 13 and (
+                apple_data[0] == 0x07 or apple_data[0] == 0x01
+            ):
+                if apple_data[1] == 0x19:
+                    left_battery = apple_data[6] & 0x0F
+                    right_battery = (apple_data[6] & 0xF0) >> 4
+                    case_battery = apple_data[7] & 0x0F
+                    if left_battery < 0x0F and right_battery < 0x0F:
+                        battery_info = f"\n[bold]Battery Levels:[/]"
+                        battery_info += f"\n  Left: {left_battery*10}%"
+                        battery_info += f"\n  Right: {right_battery*10}%"
+                        battery_info += f"\n  Case: {case_battery*10}%"
+
+        # Calculate distance trend (is it getting closer or further)
+        distance_trend = ""
+        if len(device.rssi_history) > 3:
+            first_half = list(device.rssi_history)[: len(device.rssi_history) // 2]
+            second_half = list(device.rssi_history)[len(device.rssi_history) // 2 :]
+
+            avg_first = sum(first_half) / len(first_half)
+            avg_second = sum(second_half) / len(second_half)
+
+            if avg_second > avg_first + 3:  # RSSI increased (getting closer)
+                distance_trend = " [green](moving closer)[/]"
+            elif avg_second < avg_first - 3:  # RSSI decreased (moving away)
+                distance_trend = " [red](moving away)[/]"
+            else:
+                distance_trend = " [yellow](stationary)[/]"
 
         return Panel(
             "\n".join(
                 [
                     f"[bold]Name:[/] {device.name}",
                     f"[bold]Address:[/] {device.address}",
-                    f"[bold]RSSI:[/] {device.smooth_rssi:.1f} dBm",
-                    f"[bold]Raw RSSI:[/] {device.rssi} dBm",
-                    f"[bold]Distance:[/] {device.distance:.2f} meters",
+                    f"[bold]Type:[/] {device.device_type}",
+                    f"[bold]Manufacturer:[/] {device.manufacturer}",
+                    f"[bold]RSSI:[/] {device.smooth_rssi:.1f} dBm (raw: {device.rssi} dBm)",
+                    f"[bold]Distance:[/] {device.distance:.2f} meters{distance_trend}",
                     f"[bold]Signal Stability:[/] {device.signal_stability:.2f}",
                     f"[bold]First seen:[/] {time.strftime('%H:%M:%S', time.localtime(device.first_seen))}",
                     f"[bold]Last seen:[/] {time.strftime('%H:%M:%S', time.localtime(device.last_seen))}",
@@ -369,6 +861,8 @@ class TagFinder:
                     f"[bold]N-Value:[/] {device.calibrated_n_value:.2f}",
                     f"[bold]RSSI@1m:[/] {device.calibrated_rssi_at_one_meter} dBm",
                     f"[bold]Manufacturer Data:[/] {mfg_data if mfg_data else 'None'}",
+                    f"{service_info}",
+                    f"{battery_info}",
                 ]
             ),
             title=f"[bold cyan]Device Details: {device.name}[/]",
@@ -453,11 +947,15 @@ class TagFinder:
                 name=device.name,
                 rssi=advertisement_data.rssi,
                 manufacturer_data=advertisement_data.manufacturer_data,
+                service_data=advertisement_data.service_data,
+                service_uuids=advertisement_data.service_uuids,
             )
         else:
             self.devices[device.address].update(
                 rssi=advertisement_data.rssi,
                 manufacturer_data=advertisement_data.manufacturer_data,
+                service_data=advertisement_data.service_data,
+                service_uuids=advertisement_data.service_uuids,
             )
 
             # Apply adaptive calibration if enabled
@@ -470,10 +968,35 @@ class TagFinder:
 
     async def calibrate_device(self, device: Device):
         """Calibrate the selected device"""
+        # Restore terminal settings for proper input
+        if sys.platform != "win32":
+            try:
+                import termios
+                import tty
+
+                old_settings = termios.tcgetattr(sys.stdin)
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            except:
+                pass
+
         self.console.clear()
-        self.console.print(f"[bold green]Calibrating device: {device.name}[/]")
         self.console.print(
-            "\nPlace the device at a known distance and enter the distance in meters:"
+            Panel.fit(
+                f"[bold green]Calibrating Device: {device.name}[/]",
+                title="Calibration Mode",
+                border_style="green",
+            )
+        )
+
+        self.console.print("\n[bold]Device Information:[/]")
+        self.console.print(f"  Name: {device.name}")
+        self.console.print(f"  Type: {device.device_type}")
+        self.console.print(f"  Address: {device.address}")
+        self.console.print(f"  Current RSSI: {device.rssi} dBm")
+        self.console.print(f"  Current distance estimate: {device.distance:.2f} meters")
+
+        self.console.print(
+            "\n[bold yellow]Place the device at a known distance and enter the distance in meters:[/]"
         )
 
         try:
@@ -487,20 +1010,55 @@ class TagFinder:
                 f"[yellow]Collecting RSSI readings at {distance}m distance...[/]"
             )
 
-            # Wait for scanner to collect some readings
-            for _ in range(5):
-                self.console.print(f"Current RSSI: {device.rssi} dBm")
-                await asyncio.sleep(1)
+            # Start a quick scan to collect fresh readings
+            scanner_kwargs = {}
+            if self.current_adapter:
+                scanner_kwargs["adapter"] = self.current_adapter
+
+            # Scan for a few seconds to get fresh readings
+            async with BleakScanner(**scanner_kwargs) as scanner:
+                # Wait for some readings
+                for _ in range(5):
+                    # Scan for the specific device
+                    discovered = await scanner.find_device_by_address(
+                        device.address, timeout=1.0
+                    )
+                    if discovered:
+                        self.console.print(f"Current RSSI: {device.rssi} dBm")
+                    await asyncio.sleep(1)
 
             if device.calibrate_distance(distance):
                 self.console.print(f"[bold green]Calibration successful:[/]")
                 self.console.print(f"  N-Value: {device.calibrated_n_value:.2f}")
                 self.console.print(f"  RSSI@1m: {device.calibrated_rssi_at_one_meter}")
+
+                # Update global settings with new calibration values
                 self.settings["distance_n_value"] = device.calibrated_n_value
                 self.settings["rssi_at_one_meter"] = device.calibrated_rssi_at_one_meter
                 self._save_settings()
+
+                # Also update any device-specific calibration
+                if "device_calibration" not in self.settings:
+                    self.settings["device_calibration"] = {}
+
+                self.settings["device_calibration"][device.address] = {
+                    "n_value": device.calibrated_n_value,
+                    "rssi_at_one_meter": device.calibrated_rssi_at_one_meter,
+                    "name": device.name,
+                    "type": device.device_type,
+                }
+                self._save_settings()
             else:
                 self.console.print("[bold red]Calibration failed[/]")
+
+            # Wait for user to press a key before continuing
+            self.console.print("\n[yellow]Press any key to continue...[/]")
+            if sys.platform == "win32":
+                import msvcrt
+
+                msvcrt.getch()
+            else:
+                sys.stdin.read(1)
         except ValueError:
             self.console.print("[bold red]Invalid distance value[/]")
 
@@ -515,23 +1073,78 @@ class TagFinder:
         if self.current_adapter:
             scanner_kwargs["adapter"] = self.current_adapter
 
-        async with BleakScanner(
-            detection_callback=self.discovery_callback, **scanner_kwargs
-        ) as scanner:
-            with Live(self._update_ui(), refresh_per_second=4) as live:
-                while self.scanning:
-                    live.update(self._update_ui())
-                    await asyncio.sleep(SCAN_INTERVAL)
+        try:
+            self.console.print("[green]Starting scan...[/]")
+            self.console.print(
+                "[yellow bold]Starting scan... Press 'q' to stop scanning and save results[/]"
+            )
 
-                    # Process any pending keyboard input
-                    await self._process_keyboard_input()
+            # Start the scanner in the background
+            async with BleakScanner(
+                detection_callback=self.discovery_callback, **scanner_kwargs
+            ) as scanner:
+                # Use Rich Live display to update the UI
+                with Live(self._update_ui(), refresh_per_second=4) as live:
+                    self.console.print(
+                        "[bold yellow]Press 'q' to stop scanning and save results[/]"
+                    )
 
-        # Save scan results to history
-        self._save_history()
+                    while self.scanning:
+                        # Update UI
+                        live.update(self._update_ui())
+
+                        # Simple non-blocking keyboard input
+                        if sys.platform == "win32":
+                            # Windows-specific input handling
+                            if msvcrt.kbhit():
+                                key = msvcrt.getch().decode().lower()
+                                # Only accept 'q' during scanning
+                                if key == "q":
+                                    self.scanning = False
+                        else:
+                            # Unix-like systems (Mac/Linux)
+                            # Use select to check if there's input available
+                            rlist, _, _ = select.select([sys.stdin], [], [], 0)
+                            if rlist:
+                                key = sys.stdin.read(1).lower()
+                                # Only accept 'q' during scanning
+                                if key == "q":
+                                    self.scanning = False
+
+                        # Short sleep to avoid high CPU usage
+                        await asyncio.sleep(0.1)
+        finally:
+            # Save results to history
+            self._save_history()
+
+            # Handle calibration if flagged
+            if (
+                self.calibration_mode
+                and self.selected_device
+                and self.selected_device in self.devices
+            ):
+                await self.calibrate_device(self.devices[self.selected_device])
+                self.calibration_mode = False
 
     def _update_ui(self) -> Layout:
         """Update the UI layout"""
-        self.layout["header"].update(self.generate_header())
+        if self.scanning:
+            # Simplified header during scanning
+            self.layout["header"].update(
+                Panel(
+                    f"[bold cyan]TagFinder[/] - Bluetooth Scanner | Press 'q' to quit scanning and save",
+                    style="bold",
+                    box=SIMPLE,
+                )
+            )
+        else:
+            self.layout["header"].update(
+                Panel(
+                    f"[bold cyan]TagFinder[/] - Bluetooth Scanner | Press 'q' to quit | [bold]AirTag mode:[/] {'[green]ON[/]' if self.airtag_only_mode else '[red]OFF[/]'} | [bold]Adaptive:[/] {'[green]ON[/]' if self.adaptive_mode else '[red]OFF[/]'} | [bold]Calib:[/] {'[green]ON[/]' if self.calibration_mode else '[red]OFF[/]'}",
+                    style="bold",
+                    box=SIMPLE,
+                )
+            )
         self.layout["devices"].update(self.generate_device_table(self.devices))
         self.layout["footer"].update(self.generate_status_panel())
 
@@ -546,31 +1159,7 @@ class TagFinder:
 
         return self.layout
 
-    async def _process_keyboard_input(self):
-        """Process keyboard input during scanning"""
-        # Check for keyboard input
-        if sys.stdin in asyncio.get_event_loop()._ready:
-            cmd = sys.stdin.readline().strip().lower()
-            if cmd == "q":
-                self.scanning = False
-            elif cmd == "a":
-                self.airtag_only_mode = not self.airtag_only_mode
-                self.settings["airtag_only_mode"] = self.airtag_only_mode
-                self._save_settings()
-            elif cmd == "d":
-                self.adaptive_mode = not self.adaptive_mode
-                self.settings["adaptive_mode"] = self.adaptive_mode
-                self._save_settings()
-            elif cmd == "c" and self.selected_device:
-                # Enter calibration mode
-                self.calibration_mode = True
-                await self.calibrate_device(self.devices[self.selected_device])
-                self.calibration_mode = False
-            elif cmd.isdigit() and 0 <= int(cmd) < len(self.devices):
-                # Select device by index
-                device_addresses = list(self.devices.keys())
-                if int(cmd) < len(device_addresses):
-                    self.selected_device = device_addresses[int(cmd)]
+    # Removed the _handle_key_press method as we now handle input directly in the scan loop
 
     async def main(self):
         """Main application entry point"""
@@ -594,6 +1183,8 @@ class TagFinder:
             cmd = self.console.input("[bold blue]Enter command: [/]").strip().lower()
 
             if cmd == "q":
+                # Save any unsaved settings before exit
+                self._save_settings()
                 break
             elif cmd == "s":
                 self.console.print("[green]Starting scan... Press 'q' to stop.[/]")
@@ -603,22 +1194,30 @@ class TagFinder:
                 self.settings["airtag_only_mode"] = self.airtag_only_mode
                 self._save_settings()
                 self.console.print(
-                    f"[bold]AirTag only mode: {'[green]ON[/]' if self.airtag_only_mode else '[red]OFF[/]'}"
+                    f"[bold]AirTag only mode: {'[green]ON[/]' if self.airtag_only_mode else '[red]OFF[/]'} - Settings saved"
                 )
             elif cmd == "d":
                 self.adaptive_mode = not self.adaptive_mode
                 self.settings["adaptive_mode"] = self.adaptive_mode
                 self._save_settings()
                 self.console.print(
-                    f"[bold]Adaptive distance: {'[green]ON[/]' if self.adaptive_mode else '[red]OFF[/]'}"
+                    f"[bold]Adaptive distance: {'[green]ON[/]' if self.adaptive_mode else '[red]OFF[/]'} - Settings saved"
                 )
             elif cmd == "l":
                 await self.list_adapters()
+                # Settings are saved in list_adapters() if adapter is changed
             elif cmd == "z":
                 self.summarize_findings()
+            elif cmd == "c":
+                self.calibration_mode = not self.calibration_mode
+                self.settings["calibration_mode"] = self.calibration_mode
+                self._save_settings()
+                self.console.print(
+                    f"[bold]Calibration mode: {'[green]ON[/]' if self.calibration_mode else '[red]OFF[/]'} - Settings saved"
+                )
             else:
                 self.console.print(
-                    "[yellow]Unknown command. Use 's', 'a', 'd', 'l', 'z', or 'q'.[/]"
+                    "[yellow]Unknown command. Use 's', 'a', 'd', 'c', 'l', 'z', or 'q'.[/]"
                 )
 
         self.console.print("[green]Exiting TagFinder...[/]")
