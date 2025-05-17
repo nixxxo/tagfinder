@@ -40,17 +40,12 @@ def format_time_ago(seconds: float) -> str:
 SETTINGS_FILE = "settings.json"
 HISTORY_FILE = "devices_history.json"
 AIRTAG_IDENTIFIERS = [
-    "apple",
     "airtag",
     "find my",
-    "locate",
-    "tracker",
-    "tag",
-    "tile",
-    "chipolo",
-    "samsung tag",
-    "smarttag",
-]  # Identifiers to detect AirTags and other trackers
+    "apple tag",
+    "locate me",
+    "findmy",
+]  # Focused identifiers for AirTags and Find My devices
 FIND_MY_UUIDS = [
     "7DFC9000",
     "7DFC9001",
@@ -286,333 +281,145 @@ class Device:
 
     def _extract_manufacturer(self) -> str:
         """Extract manufacturer information from BLE advertisement data"""
+        # First check for official manufacturer ID (most reliable)
         for company_id in self.manufacturer_data:
             if company_id in COMPANY_IDENTIFIERS:
                 return COMPANY_IDENTIFIERS[company_id]
 
-        # Try to guess from name or address
+        # Be very conservative with name-based identification
         if self.name:
             name_lower = self.name.lower()
-            for keyword, company in [
-                ("apple", "Apple"),
-                ("iphone", "Apple"),
-                ("ipad", "Apple"),
-                ("macbook", "Apple"),
-                ("imac", "Apple"),
-                ("watch", "Apple"),
-                ("airtag", "Apple"),
-                ("airpod", "Apple"),
-                ("samsung", "Samsung"),
-                ("galaxy", "Samsung"),
-                ("xiaomi", "Xiaomi"),
-                ("mi ", "Xiaomi"),
-                ("huawei", "Huawei"),
-                ("sony", "Sony"),
-                ("bose", "Bose"),
-                ("beats", "Apple/Beats"),
-                ("fitbit", "Fitbit"),
-                ("garmin", "Garmin"),
-                ("tile", "Tile"),
-                ("polar", "Polar"),
-                ("jbl", "JBL"),
-                ("lg", "LG"),
-                ("oneplus", "OnePlus"),
-                ("oppo", "OPPO"),
-                ("vivo", "Vivo"),
-            ]:
-                if keyword in name_lower:
-                    return company
 
-        # Check MAC address OUI (first three bytes)
-        if ":" in self.address:
-            oui = self.address.split(":")[:3]
-            # OUI matching could be implemented with a database
-            # This is a simplified example
-            oui_str = "".join(oui).upper()
-            if oui_str.startswith("AC"):
+            # Only use exact manufacturer names that are very unlikely to be ambiguous
+            exact_manufacturer_matches = {
+                "apple": "Apple",
+                "iphone": "Apple",
+                "macbook": "Apple",
+                "airpods": "Apple",
+                "airtag": "Apple",
+                "samsung": "Samsung",
+                "galaxy": "Samsung",
+                "huawei": "Huawei",
+                "xiaomi": "Xiaomi",
+                "sony": "Sony",
+                "bose": "Bose",
+                "fitbit": "Fitbit",
+                "garmin": "Garmin",
+                "tile": "Tile",
+            }
+
+            # Check for exact name matches only
+            for keyword, manufacturer in exact_manufacturer_matches.items():
+                # Use exact word boundaries to avoid false positives
+                if keyword == name_lower or f" {keyword} " in f" {name_lower} ":
+                    return manufacturer
+
+            # For devices with clear model designations
+            if (
+                name_lower.startswith("iphone")
+                or name_lower.startswith("ipad")
+                or name_lower.startswith("macbook")
+            ):
                 return "Apple"
-            elif oui_str.startswith("00:0D:4B"):
-                return "Roku"
-            elif oui_str.startswith("00:1A:11"):
-                return "Google"
 
+        # Check MAC address OUI (first three bytes) - only for well-known Apple prefixes
+        if ":" in self.address:
+            apple_ouis = ["ac:de:48", "a8:86:dd", "a4:83:e7", "7c:d1:c3", "f0:dc:e2"]
+            address_start = self.address.lower()[:8]  # Get first 3 bytes with colons
+            if any(address_start.startswith(oui) for oui in apple_ouis):
+                return "Apple"
+
+        # Default to Unknown if we don't have high confidence
         return "Unknown"
 
     def _extract_device_type(self) -> str:
         """Extract device type from BLE advertisement data"""
-        device_type = "BLE Device"
+        device_type = "Unknown"
 
-        # Check service UUIDs for known device types
-        if self.service_uuids:
-            for uuid in self.service_uuids:
-                uuid_upper = uuid.upper()
-                # Health & Fitness devices
-                if "180D" in uuid_upper:  # Heart Rate service
-                    return "Heart Rate Monitor"
-                elif "1826" in uuid_upper:  # Fitness Machine service
-                    return "Fitness Equipment"
-                elif "1809" in uuid_upper:  # Health Thermometer service
-                    return "Health Thermometer"
-                elif (
-                    "183A" in uuid_upper or "181A" in uuid_upper
-                ):  # Environmental Sensing
-                    return "Environmental Sensor"
-                elif "1819" in uuid_upper:  # Location and Navigation
-                    return "Location Tracker"
-
-        # Check for Apple device type flag in manufacturer data
+        # Start with the most reliable signals: Apple device type flags
         if 76 in self.manufacturer_data and len(self.manufacturer_data[76]) > 2:
             apple_type_byte = self.manufacturer_data[76][2] & 0x0F
             if apple_type_byte in APPLE_DEVICE_TYPES:
+                # This is very reliable - use it
                 device_type = APPLE_DEVICE_TYPES[apple_type_byte]
 
-                # For AirPods, try to get more specific model
+                # For AirPods, get more specific model if available
                 if apple_type_byte == 0x09 and len(self.manufacturer_data[76]) >= 4:
-                    # The 4th byte can sometimes identify specific AirPods models
                     model_byte = self.manufacturer_data[76][3] & 0x0F
-                    if model_byte == 0x01:
-                        return "AirPods 1st Gen"
-                    elif model_byte == 0x02:
-                        return "AirPods 2nd Gen"
-                    elif model_byte == 0x03:
-                        return "AirPods Pro"
-                    elif model_byte == 0x04:
-                        return "AirPods Max"
-                    elif model_byte == 0x05:
-                        return "AirPods 3rd Gen"
+                    airpod_types = {
+                        0x01: "AirPods 1st Gen",
+                        0x02: "AirPods 2nd Gen",
+                        0x03: "AirPods Pro",
+                        0x04: "AirPods Max",
+                        0x05: "AirPods 3rd Gen",
+                    }
+                    if model_byte in airpod_types:
+                        return airpod_types[model_byte]
 
-        # Check the name for more specific information
+        # Check service UUIDs for known device types (reliable for standardized services)
+        if self.service_uuids:
+            service_type_mapping = {
+                "180D": "Heart Rate Monitor",
+                "1826": "Fitness Equipment",
+                "183A": "Environmental Sensor",
+                "181A": "Environmental Sensor",
+                "1819": "Location Tracker",
+                "FDCD": "Tile Tracker",
+                "FD5A": "Samsung SmartTag",
+            }
+
+            for uuid in self.service_uuids:
+                uuid_short = uuid[-4:].upper()
+                if uuid_short in service_type_mapping:
+                    return service_type_mapping[uuid_short]
+
+        # Name-based identification (only for very specific, clear device names)
         if self.name:
             name_lower = self.name.lower()
 
-            # Prioritize name over manufacturer data for Apple devices
-            if "iphone" in name_lower:
-                # Try to extract iPhone model
-                if "12" in name_lower:
-                    return "iPhone 12"
-                elif "13" in name_lower:
-                    return "iPhone 13"
-                elif "14" in name_lower:
-                    return "iPhone 14"
-                elif "15" in name_lower:
-                    return "iPhone 15"
-                elif "11" in name_lower:
-                    return "iPhone 11"
-                elif "xs" in name_lower:
-                    return "iPhone XS"
-                elif "xr" in name_lower:
-                    return "iPhone XR"
-                elif "se" in name_lower:
-                    return "iPhone SE"
-                elif "x" in name_lower:
-                    return "iPhone X"
-                return "iPhone"
-            elif "ipad" in name_lower:
-                # Try to extract iPad model
-                if "pro" in name_lower:
-                    return "iPad Pro"
-                elif "air" in name_lower:
-                    return "iPad Air"
-                elif "mini" in name_lower:
-                    return "iPad Mini"
-                return "iPad"
-            elif "macbook" in name_lower or "mac book" in name_lower:
-                if "pro" in name_lower:
-                    return "MacBook Pro"
-                elif "air" in name_lower:
-                    return "MacBook Air"
-                return "MacBook"
-            elif "imac" in name_lower:
-                return "iMac"
-            elif "mac mini" in name_lower or "macmini" in name_lower:
-                return "Mac Mini"
-            elif "apple watch" in name_lower or (
-                "watch" in name_lower and self.manufacturer == "Apple"
+            # Precise Apple product identification
+            if name_lower == "airtag" or (
+                len(name_lower) >= 6 and name_lower.startswith("airtag ")
             ):
-                # Try to identify Apple Watch series
-                if "series 8" in name_lower or "s8" in name_lower:
-                    return "Apple Watch S8"
-                elif "series 7" in name_lower or "s7" in name_lower:
-                    return "Apple Watch S7"
-                elif "series 6" in name_lower or "s6" in name_lower:
-                    return "Apple Watch S6"
-                elif "series 5" in name_lower or "s5" in name_lower:
-                    return "Apple Watch S5"
-                elif "se" in name_lower:
-                    return "Apple Watch SE"
-                elif "ultra" in name_lower:
-                    return "Apple Watch Ultra"
-                return "Apple Watch"
-            elif "airpod" in name_lower:
-                if "pro" in name_lower:
-                    if "2" in name_lower:
-                        return "AirPods Pro 2"
-                    return "AirPods Pro"
-                elif "max" in name_lower:
-                    return "AirPods Max"
-                elif "3" in name_lower:
-                    return "AirPods 3rd Gen"
-                elif "2" in name_lower:
-                    return "AirPods 2nd Gen"
-                return "AirPods"
-            elif "airtag" in name_lower:
                 return "AirTag"
-            elif "beats" in name_lower:
-                if "studio" in name_lower:
-                    return "Beats Studio"
-                elif "solo" in name_lower:
-                    return "Beats Solo"
-                elif "flex" in name_lower:
-                    return "Beats Flex"
-                elif "fit" in name_lower:
-                    return "Beats Fit Pro"
-                elif "pill" in name_lower:
-                    return "Beats Pill"
-                return "Beats Headphones"
 
-            # Non-Apple devices with enhanced detection
-            elif "samsung" in name_lower:
-                if "watch" in name_lower:
-                    if "galaxy" in name_lower:
-                        return "Samsung Galaxy Watch"
-                    return "Samsung Smartwatch"
-                elif "bud" in name_lower or "earbud" in name_lower:
-                    if "pro" in name_lower:
-                        return "Samsung Galaxy Buds Pro"
-                    elif "live" in name_lower:
-                        return "Samsung Galaxy Buds Live"
-                    return "Samsung Galaxy Buds"
-                elif "tag" in name_lower or "smart tag" in name_lower:
-                    return "Samsung SmartTag"
-            elif "galaxy" in name_lower and "bud" in name_lower:
+            # Use exact matches with distinctive product names
+            if name_lower.startswith("airpods pro"):
+                return "AirPods Pro"
+            elif name_lower.startswith("airpods max"):
+                return "AirPods Max"
+            elif name_lower.startswith("airpods"):
+                return "AirPods"
+
+            # Distinctive Samsung products
+            if name_lower.startswith("galaxy buds"):
                 return "Samsung Galaxy Buds"
-            elif "google" in name_lower:
-                if "pixel bud" in name_lower:
-                    return "Google Pixel Buds"
-                elif "nest" in name_lower:
-                    return "Google Nest Device"
-            elif "nest" in name_lower:
-                return "Google Nest Device"
-            elif (
-                "xiaomi" in name_lower or "mi " in name_lower or "mi band" in name_lower
-            ):
-                if "band" in name_lower:
-                    return "Xiaomi Mi Band"
-                if "bud" in name_lower:
-                    return "Xiaomi Earbuds"
-            elif "fitbit" in name_lower:
-                if "versa" in name_lower:
-                    return "Fitbit Versa"
-                elif "sense" in name_lower:
-                    return "Fitbit Sense"
-                elif "charge" in name_lower:
-                    return "Fitbit Charge"
-                return "Fitbit Tracker"
-            elif "amazfit" in name_lower:
-                return "Amazfit Smartwatch"
-            elif "oneplus" in name_lower and "bud" in name_lower:
-                return "OnePlus Buds"
-            elif "sony" in name_lower:
-                if "wh-1000" in name_lower:
-                    return "Sony WH-1000 Headphones"
-                elif "wf" in name_lower and (
-                    "bud" in name_lower or "earphone" in name_lower
-                ):
-                    return "Sony WF Earbuds"
-                return "Sony Audio Device"
-            elif "bose" in name_lower:
-                if "qc" in name_lower or "quietcomfort" in name_lower:
-                    return "Bose QuietComfort"
-                return "Bose Audio Device"
-            elif "jabra" in name_lower:
-                if "elite" in name_lower:
-                    return "Jabra Elite Earbuds"
-                return "Jabra Headset"
-            elif "watch" in name_lower or "band" in name_lower:
-                return "Smartwatch/Fitness Band"
-            elif (
-                "headphone" in name_lower
-                or "earphone" in name_lower
-                or "earbud" in name_lower
-                or "bud" in name_lower
-                or "hearable" in name_lower
-            ):
-                return "Headphones/Earbuds"
-            elif "speaker" in name_lower:
-                return "Bluetooth Speaker"
-            elif "tag" in name_lower or "tracker" in name_lower:
-                if "tile" in name_lower:
-                    return "Tile Tracker"
-                elif "chipolo" in name_lower:
-                    return "Chipolo Tracker"
-                return "Bluetooth Tracker"
-            elif "tv" in name_lower:
-                return "Smart TV"
-            elif "roku" in name_lower:
-                return "Roku Device"
-            elif "remote" in name_lower:
-                return "Remote Control"
-            elif "keyboard" in name_lower:
-                return "Bluetooth Keyboard"
-            elif "mouse" in name_lower:
-                return "Bluetooth Mouse"
-            elif "car" in name_lower or "auto" in name_lower:
-                return "Car Accessory"
-            elif "phone" in name_lower:
-                return "Smartphone"
-            elif "pad" in name_lower or "tablet" in name_lower:
-                return "Tablet"
-            elif "camera" in name_lower:
-                return "Bluetooth Camera"
-            elif "printer" in name_lower:
-                return "Bluetooth Printer"
-            elif "scale" in name_lower:
-                return "Smart Scale"
-            elif "lock" in name_lower:
-                return "Smart Lock"
-            elif "door" in name_lower or "bell" in name_lower:
-                return "Smart Doorbell"
-            elif "light" in name_lower or "bulb" in name_lower:
-                return "Smart Light"
-            elif "therm" in name_lower:
-                return "Smart Thermostat"
-            elif "sensor" in name_lower:
-                return "IoT Sensor"
+            elif name_lower == "galaxy smarttag" or name_lower == "smarttag":
+                return "Samsung SmartTag"
 
-        # Check manufacturer data for device type clues
-        for company_id in self.manufacturer_data:
-            # Samsung devices
-            if company_id == 0x0075 or company_id == 0x0BDA:
-                if device_type == "BLE Device":
-                    data = self.manufacturer_data[company_id]
-                    if len(data) > 3:
-                        device_byte = data[2] if len(data) > 2 else 0x00
-                        if device_byte == 0x01:
-                            return "Samsung Phone"
-                        elif device_byte == 0x02:
-                            return "Samsung Tablet"
-                        elif device_byte == 0x03:
-                            return "Samsung Watch"
-                        elif device_byte == 0x04:
-                            return "Samsung Buds"
-                        elif device_byte == 0x05:
-                            return "Samsung SmartTag"
-                        return "Samsung Device"
-
-            # Tile trackers
-            elif company_id == 0x02D0:
+            # Specific tracker products
+            if name_lower == "tile" or name_lower.startswith("tile "):
                 return "Tile Tracker"
-
-            # Chipolo trackers
-            elif company_id == 0x010C:
+            elif name_lower == "chipolo" or name_lower.startswith("chipolo "):
                 return "Chipolo Tracker"
 
-            # Fitbit devices
-            elif company_id == 0x01DF or company_id == 0x0157:
-                return "Fitbit Device"
+        # Check manufacturer data for company-specific device bytes (for known formats)
+        for company_id in self.manufacturer_data:
+            data = self.manufacturer_data[company_id]
 
-        # Check for specific iBeacon/Eddystone formats
-        for company_id, data in self.manufacturer_data.items():
+            # Samsung devices with known format
+            if company_id == 0x0075 and len(data) > 3:
+                samsung_device_types = {
+                    0x01: "Samsung Phone",
+                    0x02: "Samsung Tablet",
+                    0x03: "Samsung Watch",
+                    0x04: "Samsung Buds",
+                    0x05: "Samsung SmartTag",
+                }
+                device_byte = data[2] if len(data) > 2 else 0
+                if device_byte in samsung_device_types:
+                    return samsung_device_types[device_byte]
+
             # Apple iBeacon format
             if (
                 company_id == 0x004C
@@ -622,12 +429,20 @@ class Device:
             ):
                 return "iBeacon"
 
-            # Eddystone format
-            if company_id == 0x00E0 and len(data) >= 20:
-                return "Eddystone Beacon"
+            # Tile tracker
+            if company_id == 0x02D0:
+                return "Tile Tracker"
 
-        # Keep the Apple device type from manufacturer data if we didn't find a better match
-        return device_type
+            # Chipolo tracker
+            if company_id == 0x010C:
+                return "Chipolo Tracker"
+
+        # If we got a device type from Apple manufacturer data but didn't find anything more specific
+        if device_type != "Unknown":
+            return device_type
+
+        # Return a generic BLE device type
+        return "BLE Device"
 
     def _extract_detailed_info(self) -> str:
         """Extract detailed information from BLE advertisement data"""
@@ -813,72 +628,107 @@ class Device:
 
     def _check_if_airtag(self) -> bool:
         """Check if device is potentially an AirTag or other tracking device"""
-        # First check if name contains any tracker identifiers
-        if self.name and any(
-            identifier in self.name.lower() for identifier in AIRTAG_IDENTIFIERS
+        # Store verification flags with confidence levels
+        evidence = {
+            "name_match": False,
+            "apple_manufacturer": False,
+            "find_my_pattern": False,
+            "airtag_pattern": False,
+            "known_uuid": False,
+            "service_data": False,
+        }
+
+        # Check manufacturer first - must be Apple for AirTags
+        if 76 in self.manufacturer_data:  # Apple's company identifier (0x004C)
+            evidence["apple_manufacturer"] = True
+
+            # Now check Apple-specific data patterns with high confidence
+            data = self.manufacturer_data[76]
+
+            # Only proceed with pattern matching if we have enough data
+            if len(data) > 2:
+                # Exact Find My network pattern (highest confidence)
+                if data[0] == 0x12 and data[1] == 0x19:
+                    evidence["find_my_pattern"] = True
+
+                    # Exact AirTag identifier pattern
+                    if len(data) > 3 and data[2] & 0x0F == 0x0A:  # AirTag type is 0x0A
+                        evidence["airtag_pattern"] = True
+
+        # If name contains clear AirTag identifiers (but only specific ones, not general terms)
+        if self.name and (
+            "airtag" in self.name.lower()
+            or "find my" in self.name.lower()
+            or "apple tag" in self.name.lower()
+        ):
+            evidence["name_match"] = True
+
+        # Check for Find My Network specific UUIDs (high confidence indicators)
+        high_confidence_uuids = [
+            "7DFC9000",
+            "7DFC9001",
+            "0000FD44",
+            "74278BDA-B644-4520-8F0C-720EAF059935",
+        ]
+        for uuid in self.service_uuids:
+            uuid_upper = uuid.upper()
+            for find_my_id in high_confidence_uuids:
+                if find_my_id in uuid_upper:
+                    evidence["known_uuid"] = True
+                    break
+
+        # Check for specific service data patterns related to Find My network
+        for service_uuid, _ in self.service_data.items():
+            if service_uuid.upper() in ["7DFC9000", "7DFC9001", "0000FD44"]:
+                evidence["service_data"] = True
+                break
+
+        # Apply decision rules for classification:
+
+        # Definite AirTag/Find My device (extremely high confidence)
+        if (
+            evidence["apple_manufacturer"]
+            and (evidence["find_my_pattern"] or evidence["airtag_pattern"])
+        ) or (
+            evidence["apple_manufacturer"]
+            and evidence["known_uuid"]
+            and evidence["name_match"]
         ):
             return True
 
-        # Check for specific tracking devices based on detailed patterns
-        for tracker_type, tracker_info in TRACKING_DEVICE_TYPES.items():
-            # Check manufacturer ID
-            if tracker_info["company_id"] in self.manufacturer_data:
-                data = self.manufacturer_data[tracker_info["company_id"]]
+        # High confidence Find My device
+        if (evidence["apple_manufacturer"] and evidence["known_uuid"]) or (
+            evidence["apple_manufacturer"] and evidence["service_data"]
+        ):
+            return True
 
-                # Check data patterns if available
-                if tracker_info["data_patterns"]:
-                    pattern_matches = True
-                    for pattern in tracker_info["data_patterns"]:
-                        offset = pattern["offset"]
-                        if (
-                            len(data) <= offset
-                            or (data[offset] & pattern["mask"]) != pattern["value"]
-                        ):
-                            pattern_matches = False
-                            break
-                    if pattern_matches:
-                        return True
+        # For non-Apple manufacturers, require stronger evidence for trackers
+        if not evidence["apple_manufacturer"]:
+            # Check for specific non-Apple tracking devices
+            for tracker_type, tracker_info in TRACKING_DEVICE_TYPES.items():
+                if tracker_type == "AIRTAG":
+                    continue  # Already handled above
 
-                # If no specific pattern defined but company ID matches, check UUIDs
-                for uuid in self.service_uuids:
-                    if any(
-                        tracker_uuid in uuid.upper()
-                        for tracker_uuid in tracker_info["uuids"]
-                    ):
-                        return True
+                # Verify manufacturer ID matches
+                if tracker_info["company_id"] in self.manufacturer_data:
+                    # For non-Apple devices, require exact UUID matches
+                    for uuid in self.service_uuids:
+                        uuid_upper = uuid.upper()
+                        exact_match = False
+                        for tracker_uuid in tracker_info["uuids"]:
+                            if uuid_upper == tracker_uuid:
+                                exact_match = True
+                                break
 
-        # Check for Apple-specific identifiers (Find My network)
-        if 76 in self.manufacturer_data:  # Apple's company identifier (0x004C)
-            data = self.manufacturer_data[76]
+                        if exact_match:
+                            # Verify with name match for higher confidence
+                            if self.name and any(
+                                identifier in self.name.lower()
+                                for identifier in tracker_info["identifiers"]
+                            ):
+                                return True
 
-            # Find My network signals
-            if len(data) > 2:
-                # Various Find My patterns
-                if (data[0] == 0x12 and data[1] == 0x19) or (data[0] == 0x10):
-                    return True
-
-                # Check for AirTag type identifier
-                if len(data) > 3 and data[2] & 0x0F == 0x0A:  # AirTag type is 0x0A
-                    return True
-
-                # Check for other Apple tracking-related patterns
-                if data[0] in [0x02, 0x05, 0x07, 0x0F] and len(data) >= 5:
-                    # These values are often associated with tracking in Apple devices
-                    return True
-
-        # Check service UUIDs for Find My related services
-        for uuid in self.service_uuids:
-            uuid_upper = uuid.upper()
-            for find_my_id in FIND_MY_UUIDS:
-                if find_my_id in uuid_upper:
-                    return True
-
-        # Look for specific service data patterns
-        for service_uuid, service_data in self.service_data.items():
-            # Check for specific service data patterns related to tracking
-            if service_uuid.upper() in ["FD5A", "FDCD", "7DFC9000", "FD44", "0000FD44"]:
-                return True
-
+        # Default to false - require explicit evidence
         return False
 
     def get_tracker_type(self) -> str:
@@ -886,32 +736,69 @@ class Device:
         if not self.is_airtag:
             return "Not a tracker"
 
-        # Check for AirTag
+        # --- AirTag Identification (High Confidence) ---
         if self.manufacturer == "Apple":
-            if "airtag" in self.name.lower() or (
-                76 in self.manufacturer_data
-                and len(self.manufacturer_data[76]) > 2
-                and self.manufacturer_data[76][2] & 0x0F == 0x0A
-            ):
+            # Definitive AirTag signal from manufacturer data
+            if 76 in self.manufacturer_data and len(self.manufacturer_data[76]) > 2:
+                if (
+                    len(self.manufacturer_data[76]) > 3
+                    and self.manufacturer_data[76][2] & 0x0F == 0x0A
+                ):
+                    return "Apple AirTag"
+
+            # Clear name match
+            if self.name and "airtag" in self.name.lower():
                 return "Apple AirTag"
+
+            # Find My network protocol without specific AirTag identifier
+            if 76 in self.manufacturer_data and len(self.manufacturer_data[76]) >= 2:
+                if (
+                    self.manufacturer_data[76][0] == 0x12
+                    and self.manufacturer_data[76][1] == 0x19
+                ):
+                    # Find My protocol but not specifically AirTag
+                    return "Apple Find My Device"
+
+            # Check for Find My Network specific UUIDs
+            for uuid in self.service_uuids:
+                if any(
+                    find_my_id in uuid.upper()
+                    for find_my_id in ["7DFC9000", "7DFC9001", "0000FD44"]
+                ):
+                    return "Apple Find My Device"
+
+            # Other Apple device that uses Find My network
             return "Apple Find My Device"
 
-        # Samsung SmartTag
-        if self.manufacturer == "Samsung" or any(
-            tag in self.name.lower()
-            for tag in ["smarttag", "samsung tag", "galaxy tag"]
-        ):
-            return "Samsung SmartTag"
+        # --- Samsung SmartTag Identification ---
+        if self.manufacturer == "Samsung":
+            if (
+                "smarttag" in self.name.lower()
+                or "smart tag" in self.name.lower()
+                or "galaxy tag" in self.name.lower()
+            ):
+                return "Samsung SmartTag"
 
-        # Tile trackers
-        if self.manufacturer == "Tile" or "tile" in self.name.lower():
+            # Check for Samsung SmartTag service UUID
+            for uuid in self.service_uuids:
+                if "FD5A" in uuid.upper():
+                    return "Samsung SmartTag"
+
+        # --- Tile Identification ---
+        if self.manufacturer == "Tile" or any(
+            "tile" == word for word in self.name.lower().split()
+        ):
             return "Tile Tracker"
 
-        # Chipolo trackers
+        # --- Chipolo Identification ---
         if "chipolo" in self.name.lower():
-            return "Chipolo Tracker"
+            for uuid in self.service_uuids:
+                if any(
+                    chipolo_uuid in uuid.upper() for chipolo_uuid in ["FEE1", "FEE0"]
+                ):
+                    return "Chipolo Tracker"
 
-        # Generic tracker if we can't identify the specific type
+        # Generic tracker if we can't identify the specific type but it triggered our tracker detection
         return "Unknown Tracker"
 
     @property
@@ -1410,6 +1297,21 @@ class TagFinder:
         # Sort devices by RSSI (closest first)
         sorted_devices = sorted(devices.values(), key=lambda d: d.rssi, reverse=True)
 
+        # For AirTag only mode, filter to only include actual AirTags or Find My devices
+        if self.airtag_only_mode:
+            filtered_devices = []
+            for device in sorted_devices:
+                # Only include devices that are definitely AirTags or Find My devices
+                if device.is_airtag:
+                    # Get the specific tracker type
+                    tracker_type = device.get_tracker_type()
+                    # Only include if it's a known Apple tracker or Find My device
+                    if "Apple" in tracker_type and (
+                        "AirTag" in tracker_type or "Find My" in tracker_type
+                    ):
+                        filtered_devices.append(device)
+            sorted_devices = filtered_devices
+
         # Store sorted list for tab-based selection
         self.sorted_device_list = sorted_devices
 
@@ -1419,7 +1321,7 @@ class TagFinder:
         visible_devices = 0
 
         for i, device in enumerate(sorted_devices):
-            # Skip non-AirTags if in AirTag only mode
+            # Skip non-AirTags if in AirTag only mode - redundant now but keeping as safety check
             if self.airtag_only_mode and not device.is_airtag:
                 continue
 
@@ -1451,8 +1353,16 @@ class TagFinder:
             else:
                 rssi_color = "red"
 
-            # Color code for AirTags
-            name_color = "bright_cyan" if device.is_airtag else "white"
+            # Color code for AirTags and Find My devices
+            tracker_type = (
+                device.get_tracker_type() if device.is_airtag else "Not a tracker"
+            )
+            if device.is_airtag and "Apple AirTag" in tracker_type:
+                name_color = "bright_red"  # Highlight AirTags more prominently
+            elif device.is_airtag and "Find My" in tracker_type:
+                name_color = "bright_yellow"  # Find My devices in yellow
+            else:
+                name_color = "white"
 
             # Highlight selected device
             style = "on blue" if device.address == self.selected_device else ""
@@ -1550,10 +1460,15 @@ class TagFinder:
 
         if not sorted_devices or visible_devices == 0:
             # Create empty row data based on how many columns we have
-            empty_row = ["No devices found"]
+            if self.airtag_only_mode:
+                empty_message = "No Find My devices or AirTags found"
+            else:
+                empty_message = "No devices found"
+
+            empty_row = [empty_message]
             empty_columns = (
                 len(table.columns) - 1
-            )  # -1 because we already added "No devices found"
+            )  # -1 because we already added message
 
             for _ in range(empty_columns):
                 empty_row.append("")
@@ -1597,7 +1512,7 @@ class TagFinder:
                     [
                         "[bold cyan]Controls:[/]",
                         " [bold blue]s[/] - Start/Stop scanning",
-                        " [bold blue]a[/] - Toggle AirTag only mode",
+                        " [bold blue]a[/] - Toggle Find My mode",
                         " [bold blue]d[/] - Toggle adaptive mode",
                         " [bold blue]c[/] - Toggle calibration mode",
                         " [bold blue]l[/] - List Bluetooth adapters",
@@ -1616,7 +1531,7 @@ class TagFinder:
                 "\n".join(
                     [
                         f"[bold]Status:[/] [yellow]Idle[/]",
-                        f"[bold]AirTag mode:[/] {airtag_mode}",
+                        f"[bold]Find My mode:[/] {airtag_mode}",
                         f"[bold]Adaptive:[/] {adaptive_mode}",
                         f"[bold]Calibration:[/] {calibration_mode}",
                         f"[bold]Adapter:[/] {self.current_adapter or 'Default'}",
@@ -1638,10 +1553,10 @@ class TagFinder:
                 "\n".join(
                     [
                         "[bold cyan]Controls:[/]",
-                        " [bold blue]s[/] - Scan [bold blue]a[/] - AirTag mode [bold blue]d[/] - Adaptive",
+                        " [bold blue]s[/] - Scan [bold blue]a[/] - Find My mode [bold blue]d[/] - Adaptive",
                         " [bold blue]c[/] - Calibration [bold blue]l[/] - Adapters [bold blue]z[/] - Analyze [bold blue]q[/] - Quit",
                         "",
-                        f"[bold]Status:[/] [yellow]Idle[/] | AirTag: {airtag_mode} | Adaptive: {adaptive_mode} | Calib: {calibration_mode}",
+                        f"[bold]Status:[/] [yellow]Idle[/] | Find My: {airtag_mode} | Adaptive: {adaptive_mode} | Calib: {calibration_mode}",
                         f"[bold]Adapter:[/] {self.current_adapter or 'Default'}",
                     ]
                 ),
@@ -2884,7 +2799,7 @@ class TagFinder:
                         f"[bold]Duration:[/] {scan_duration}",
                         f"[bold]Devices found:[/] {device_count}",
                         "",
-                        f"[bold]AirTag mode:[/] {airtag_mode}",
+                        f"[bold]Find My mode:[/] {airtag_mode}",
                         f"[bold]Adaptive:[/] {adaptive_mode}",
                         f"[bold]Calibration:[/] {calibration_mode}",
                         f"[bold]Adapter:[/] {self.current_adapter or 'Default'}",
@@ -3010,9 +2925,27 @@ class TagFinder:
                 self.airtag_only_mode = not self.airtag_only_mode
                 self.settings["airtag_only_mode"] = self.airtag_only_mode
                 self._save_settings()
-                self.console.print(
-                    f"[bold]AirTag only mode: {'[green]ON[/]' if self.airtag_only_mode else '[red]OFF[/]'} - Settings saved"
-                )
+
+                # Provide clear feedback on what the mode does
+                if self.airtag_only_mode:
+                    self.console.print(
+                        Panel.fit(
+                            "[bold green]Find My/AirTag Mode: ON[/]\n\n"
+                            + "Only Apple AirTags and Find My enabled devices will be displayed.\n"
+                            + "This mode applies strict detection criteria to avoid false positives.",
+                            title="Mode Changed",
+                            border_style="green",
+                        )
+                    )
+                else:
+                    self.console.print(
+                        Panel.fit(
+                            "[bold red]Find My/AirTag Mode: OFF[/]\n\n"
+                            + "All Bluetooth devices will be displayed.",
+                            title="Mode Changed",
+                            border_style="yellow",
+                        )
+                    )
             elif cmd == "d":
                 # Clear terminal before toggle
                 self.console.clear()
