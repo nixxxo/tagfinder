@@ -1134,13 +1134,24 @@ class Device:
         trend_direction = "stable"
         change_rate = 0.0
 
-        # Initialize previous distance if not set
-        if self.previous_distance is None:
+        # Initialize previous distance and trend history if not set
+        if not hasattr(self, "previous_distance") or self.previous_distance is None:
             self.previous_distance = current_distance
+            self.last_trend_update = current_time
+            if not hasattr(self, "distance_trend"):
+                self.distance_trend = []
             return trend_direction, change_rate
 
-        # Calculate time since last update (minimum 1 second to avoid division by zero)
-        time_diff = max(1.0, current_time - self.last_trend_update)
+        # Only update if enough time has passed (100ms minimum)
+        if current_time - self.last_trend_update < 0.1:
+            # Return the last trend if available
+            if hasattr(self, "distance_trend") and self.distance_trend:
+                _, _, last_trend, last_rate = self.distance_trend[-1]
+                return last_trend, last_rate
+            return trend_direction, change_rate
+
+        # Calculate time since last update (minimum 0.1 second to avoid division by zero)
+        time_diff = max(0.1, current_time - self.last_trend_update)
 
         # Calculate distance change
         distance_diff = current_distance - self.previous_distance
@@ -1148,19 +1159,29 @@ class Device:
         # Calculate rate of change (meters per second)
         change_rate = distance_diff / time_diff
 
+        # Apply smoothing to reduce fluctuations (exponential moving average)
+        if hasattr(self, "distance_trend") and self.distance_trend:
+            _, _, _, last_rate = self.distance_trend[-1]
+            # Blend new and old rates (70% new, 30% old)
+            change_rate = (0.7 * change_rate) + (0.3 * last_rate)
+
         # Determine trend direction with dampening to avoid small fluctuations
-        if abs(change_rate) < 0.05:  # Less than 5cm per second is considered stable
+        if abs(change_rate) < 0.03:  # Less than 3cm per second is considered stable
             trend_direction = "stable"
         elif change_rate < 0:
             trend_direction = "closer"  # Getting closer (negative rate)
         else:
             trend_direction = "further"  # Getting further (positive rate)
 
-        # Add to trend history (keep last 5 updates)
+        # Initialize distance_trend if not already done
+        if not hasattr(self, "distance_trend"):
+            self.distance_trend = []
+
+        # Add to trend history (keep last 10 updates for better analysis)
         self.distance_trend.append(
             (current_time, current_distance, trend_direction, change_rate)
         )
-        if len(self.distance_trend) > 5:
+        if len(self.distance_trend) > 10:
             self.distance_trend.pop(0)
 
         # Update previous values for next calculation
@@ -1171,7 +1192,7 @@ class Device:
 
     def get_trend_summary(self) -> str:
         """Get a human-readable summary of the proximity trend"""
-        if not self.distance_trend:
+        if not hasattr(self, "distance_trend") or not self.distance_trend:
             return "Monitoring proximity trend..."
 
         # Get the latest trend
@@ -1208,6 +1229,154 @@ class Device:
         else:  # further
             confidence = "Consistently" if consistent else "Possibly"
             return f"{confidence} moving away {rate_text} ({rate_abs:.2f}m/s)"
+
+    def get_detailed_proximity_analysis(self) -> Dict:
+        """Get detailed proximity analysis with prediction"""
+        if (
+            not hasattr(self, "distance_trend")
+            or not self.distance_trend
+            or len(self.distance_trend) < 2
+        ):
+            return {
+                "status": "initializing",
+                "message": "Initializing trend analysis...",
+                "direction": "unknown",
+                "rate": 0.0,
+                "prediction": None,
+                "confidence": 0.0,
+                "data_points": (
+                    len(self.distance_trend)
+                    if hasattr(self, "distance_trend") and self.distance_trend
+                    else 0
+                ),
+            }
+
+        # Current and previous readings
+        current_time, current_distance, current_trend, current_rate = (
+            self.distance_trend[-1]
+        )
+
+        # Calculate average rate from last 3 readings if available
+        rates = [rate for _, _, _, rate in self.distance_trend[-3:]]
+        avg_rate = sum(rates) / len(rates)
+
+        # Count direction occurrences for confidence calculation
+        directions = [trend for _, _, trend, _ in self.distance_trend]
+        direction_counts = {
+            "closer": directions.count("closer"),
+            "further": directions.count("further"),
+            "stable": directions.count("stable"),
+        }
+
+        # Determine dominant direction
+        dominant_direction = max(direction_counts, key=direction_counts.get)
+
+        # Calculate confidence level (0.0 to 1.0)
+        confidence = direction_counts[dominant_direction] / len(directions)
+
+        # Make short-term prediction (where will distance be in 5 seconds)
+        prediction_time = 5.0  # seconds
+        predicted_distance = current_distance + (avg_rate * prediction_time)
+        predicted_distance = max(0.1, predicted_distance)  # Ensure positive distance
+
+        # Generate human-readable status message
+        if dominant_direction == "closer":
+            status = "approaching"
+            verb = "reach" if predicted_distance < 0.5 else "be"
+            time_to_target = (
+                abs(current_distance / avg_rate) if avg_rate != 0 else float("inf")
+            )
+
+            if confidence > 0.8:
+                confidence_text = "Definitely"
+            elif confidence > 0.6:
+                confidence_text = "Likely"
+            else:
+                confidence_text = "Possibly"
+
+            if time_to_target < 30 and time_to_target > 0:
+                eta = f"ETA: ~{time_to_target:.1f} seconds"
+            else:
+                eta = ""
+
+            message = f"{confidence_text} getting closer. You'll {verb} ~{predicted_distance:.2f}m in 5s. {eta}"
+
+        elif dominant_direction == "further":
+            status = "moving_away"
+
+            if confidence > 0.8:
+                confidence_text = "Definitely"
+            elif confidence > 0.6:
+                confidence_text = "Likely"
+            else:
+                confidence_text = "Possibly"
+
+            message = f"{confidence_text} moving away. Distance in 5s: ~{predicted_distance:.2f}m"
+
+        else:  # stable
+            status = "stable"
+            message = f"Distance is stable at {current_distance:.2f}m"
+
+        return {
+            "status": status,
+            "message": message,
+            "direction": dominant_direction,
+            "rate": avg_rate,
+            "prediction": {"time": prediction_time, "distance": predicted_distance},
+            "confidence": confidence,
+            "current_distance": current_distance,
+            "data_points": len(self.distance_trend),
+        }
+
+    def get_movement_guidance(self) -> str:
+        """Generate guidance to help user locate the device"""
+        # Get the detailed analysis first
+        analysis = self.get_detailed_proximity_analysis()
+
+        if analysis["status"] == "initializing":
+            return "Move slowly in any direction to establish a baseline..."
+
+        current_distance = analysis.get("current_distance", self.distance)
+        direction = analysis.get("direction", "unknown")
+        rate = analysis.get("rate", 0.0)
+        confidence = analysis.get("confidence", 0.0)
+
+        # Very close to device
+        if current_distance < 0.5:
+            return "VERY CLOSE! Look around carefully, you should be able to see the device."
+
+        # Close range
+        elif current_distance < 2.0:
+            if direction == "closer":
+                return "You're on the right track! Continue in this direction."
+            elif direction == "further":
+                return "Wrong way! Turn around and go in the opposite direction."
+            else:
+                return (
+                    "You're at a steady distance. Try moving in different directions."
+                )
+
+        # Medium range
+        elif current_distance < 5.0:
+            if direction == "closer" and abs(rate) > 0.1:
+                return "Good progress! Keep moving in this direction."
+            elif direction == "closer" and abs(rate) <= 0.1:
+                return "Correct direction but moving slowly. Try to speed up."
+            elif direction == "further":
+                return "Wrong direction! Try a different approach."
+            else:
+                return "You're maintaining distance. Try moving more deliberately in one direction."
+
+        # Long range
+        else:
+            if confidence < 0.5:
+                return "Signal is unstable at this distance. Move in larger steps to establish direction."
+            elif direction == "closer":
+                return "You're heading in the right direction. Keep going."
+            elif direction == "further":
+                return "You're moving away from the device. Change direction."
+            else:
+                return "You're moving parallel to the device. Try changing direction."
 
     def to_dict(self) -> Dict:
         """Convert device to dictionary for storage"""
@@ -1530,10 +1699,10 @@ class TagFinder:
         """Generate a table of devices for display"""
         # Create a responsive table that adapts to available space
         table = Table(
-            title="[bold]Bluetooth Devices[/]",
+            title="[bold]Bluetooth Devices[/] [dim](Sorted by: Last seen → Distance → Track probability)[/]",
             box=ROUNDED,
             highlight=True,
-            title_style="bold cyan",
+            style="bold cyan",
             border_style="blue",
             expand=True,  # Make table expand to fill available width
         )
@@ -1564,7 +1733,7 @@ class TagFinder:
 
         # Only show seen time column if no device is selected
         if not has_selected or self.console.width > 120:
-            table.add_column("Seen", justify="right", ratio=1)
+            table.add_column("Last Seen", justify="right", ratio=1)
 
         # Always show details but adjust width based on available space
         if self.console.width > 140:
@@ -1572,8 +1741,29 @@ class TagFinder:
         else:
             table.add_column("Details", ratio=4, no_wrap=False)
 
-        # Sort devices by RSSI (closest first)
-        sorted_devices = sorted(devices.values(), key=lambda d: d.rssi, reverse=True)
+        # Create a sorting function that prioritizes:
+        # 1. Last seen (most recent first)
+        # 2. Distance (closest first)
+        # 3. Tracker probability (highest confidence first)
+        def multi_sort_key(device):
+            # Negative last_seen puts most recent first
+            last_seen_key = -device.last_seen
+
+            # Distance (smaller values first)
+            distance_key = device.distance if device.distance < 100 else 100
+
+            # Tracker probability (convert confidence to numeric value, lower is higher confidence)
+            if device.is_airtag:
+                tracker_key = (
+                    device.tracker_confidence
+                )  # Lower values = higher confidence
+            else:
+                tracker_key = 999  # Non-trackers at bottom
+
+            return (last_seen_key, distance_key, tracker_key)
+
+        # Sort devices by our multi-sort key
+        sorted_devices = sorted(devices.values(), key=multi_sort_key)
 
         # For AirTag only mode, filter to only include actual AirTags or Find My devices
         if self.airtag_only_mode:
@@ -1620,7 +1810,17 @@ class TagFinder:
             visible_devices += 1
 
             distance = f"{device.distance:.2f}m" if device.distance < 100 else "Unknown"
-            seen_time = f"{device.seen_duration:.1f}s"
+
+            # Format last seen ago in a more human-readable way
+            time_since_last_seen = time.time() - device.last_seen
+            if time_since_last_seen < 10:
+                seen_time = "Just now"
+            elif time_since_last_seen < 60:
+                seen_time = f"{time_since_last_seen:.0f}s ago"
+            elif time_since_last_seen < 3600:
+                seen_time = f"{time_since_last_seen/60:.1f}m ago"
+            else:
+                seen_time = f"{time_since_last_seen/3600:.1f}h ago"
 
             # Color code RSSI for signal strength
             rssi_str = str(int(device.smooth_rssi))
@@ -1780,9 +1980,17 @@ class TagFinder:
                 ]
             )
 
-            # Add seen time if column exists
+            # Add seen time if column exists, with color coding
             if not has_selected or self.console.width > 120:
-                row_data.append(seen_time)
+                # Color code last seen times
+                if time_since_last_seen < 30:
+                    seen_style = "green"  # Very recent
+                elif time_since_last_seen < 300:
+                    seen_style = "yellow"  # Within last 5 minutes
+                else:
+                    seen_style = "red"  # Older
+
+                row_data.append(Text(seen_time, style=f"{seen_style}"))
 
             # Always add details
             row_data.append(details)
@@ -2347,7 +2555,7 @@ class TagFinder:
             title="[bold]Available Devices[/]",
             box=ROUNDED,
             highlight=True,
-            title_style="bold cyan",
+            style="bold cyan",
             border_style="blue",
         )
 
@@ -3258,7 +3466,9 @@ class TagFinder:
                     ]
 
             # Use Rich Live display for UI updates during all scanning phases
-            with Live(self._update_ui(), refresh_per_second=4) as live:
+            # Increase refresh rate for more responsive real-time updates
+            refresh_rate = 10  # Higher refresh rate (10 updates per second)
+            with Live(self._update_ui(), refresh_per_second=refresh_rate) as live:
                 # Main scan loop that continues indefinitely until user quits
                 scan_start_time = time.time()
 
@@ -3776,25 +3986,36 @@ class TagFinder:
 
             # Create the main scanning layout
             if self.selected_device and self.selected_device in self.devices:
-                # When a device is selected, show detailed view with controls, details and table
-                scanning_layout.split(
-                    Layout(name="controls", size=12),
-                    Layout(name="main_content", ratio=1),
+                # When a device is selected, show the dedicated proximity tracking view
+                # Use the new proximity view for better real-time tracking
+                selected_device = self.devices[self.selected_device]
+
+                # Make sure proximity tracking is initialized
+                if (
+                    not hasattr(selected_device, "previous_distance")
+                    or selected_device.previous_distance is None
+                ):
+                    selected_device.previous_distance = selected_device.distance
+                    selected_device.last_trend_update = time.time()
+
+                # Optimize updates for selected device - update more frequently for selected devices
+                current_time = time.time()
+                elapsed_time = current_time - getattr(
+                    selected_device, "last_trend_update", 0
                 )
 
-                # Split the main content area to show device details and table
-                scanning_layout["main_content"].split_row(
-                    Layout(name="device_details", ratio=2),
-                    Layout(name="devices", ratio=3),
-                )
+                # Update interval is shorter for proximity tracking (100ms instead of normal interval)
+                proximity_update_interval = 0.1  # 100ms for very responsive updates
 
-                scanning_layout["controls"].update(top_panel)
-                scanning_layout["device_details"].update(
-                    self.generate_device_details(self.devices[self.selected_device])
-                )
-                scanning_layout["devices"].update(
-                    self.generate_device_table(self.devices)
-                )
+                if elapsed_time >= proximity_update_interval:
+                    # Force an update to smooth RSSI value
+                    if len(selected_device.rssi_history) > 0:
+                        # Update proximity trend with latest data for real-time feedback
+                        selected_device.update_proximity_trend()
+                        selected_device.last_trend_update = current_time
+
+                # Return dedicated proximity tracking view
+                return self.generate_proximity_view(selected_device)
             else:
                 # Normal layout when no device is selected
                 scanning_layout.split(
@@ -3828,10 +4049,34 @@ class TagFinder:
 
             # Update device details if a device is selected
             if self.selected_device and self.selected_device in self.devices:
-                self.layout["details"].visible = True
-                self.layout["details"].update(
-                    self.generate_device_details(self.devices[self.selected_device])
+                selected_device = self.devices[self.selected_device]
+
+                # Make sure proximity tracking is initialized
+                if (
+                    not hasattr(selected_device, "previous_distance")
+                    or selected_device.previous_distance is None
+                ):
+                    selected_device.previous_distance = selected_device.distance
+                    selected_device.last_trend_update = time.time()
+
+                # Optimize updates for selected device in non-scanning mode too
+                current_time = time.time()
+                elapsed_time = current_time - getattr(
+                    selected_device, "last_trend_update", 0
                 )
+
+                # Same optimized update interval for proximity tracking
+                proximity_update_interval = 0.1  # 100ms for very responsive updates
+
+                if elapsed_time >= proximity_update_interval:
+                    # Force update when enough time has passed
+                    if len(selected_device.rssi_history) > 0:
+                        # Update proximity trend with latest data for real-time feedback
+                        selected_device.update_proximity_trend()
+                        selected_device.last_trend_update = current_time
+
+                # Use the new proximity view instead of details panel
+                return self.generate_proximity_view(selected_device)
             else:
                 self.layout["details"].visible = False
 
@@ -4633,6 +4878,581 @@ class TagFinder:
             self.console.print(f"[bold yellow]Error finding adapters: {e}[/]")
 
         return adapters
+
+    def generate_proximity_view(self, device: Device) -> Layout:
+        """Generate a focused proximity tracking view for the selected device"""
+        # Create a layout for the proximity view
+        layout = Layout()
+
+        # Split the layout into sections
+        layout.split(
+            Layout(name="header", size=3),
+            Layout(name="main_content", ratio=1),
+            Layout(name="footer", size=3),
+        )
+
+        # Split the main content area into sections
+        layout["main_content"].split_row(
+            Layout(name="device_info", ratio=1),
+            Layout(name="proximity_data", ratio=2),
+        )
+
+        # Split the proximity data section into components
+        layout["proximity_data"].split(
+            Layout(name="distance_gauge", ratio=2),
+            Layout(name="trend_analysis", ratio=2),
+            Layout(name="guidance", ratio=1),
+        )
+
+        # Create header with device name and type with proper styling
+        device_type_color = "red" if device.is_airtag else "cyan"
+        header_text = Text()
+        header_text.append(device.name, style="bold white")
+        header_text.append(" (")
+        header_text.append(device.device_type, style=device_type_color)
+        header_text.append(")")
+
+        header = Panel(
+            header_text,
+            title="Proximity Tracking",
+            title_align="center",
+            style="bold cyan",
+            border_style="cyan",
+            box=ROUNDED,
+        )
+        layout["header"].update(header)
+
+        # Create device information panel with proper styling
+        device_info_text = Text()
+        device_info_text.append("\n◉ Device Details\n\n", style="bold cyan")
+
+        device_info_text.append("Address: ", style="bold")
+        device_info_text.append(f"{device.address}\n")
+
+        device_info_text.append("Manufacturer: ", style="bold")
+        device_info_text.append(f"{device.manufacturer}\n")
+
+        # Add battery info if available
+        if "Battery" in device.device_details:
+            device_info_text.append(f"Battery: ", style="bold")
+            battery_info = device.device_details.split("Battery: ")[1].split("%")[0]
+            try:
+                battery_level = int(battery_info)
+                battery_color = (
+                    "green"
+                    if battery_level > 50
+                    else "yellow" if battery_level > 20 else "red"
+                )
+                device_info_text.append(f"{battery_level}%\n", style=battery_color)
+            except ValueError:
+                device_info_text.append(f"{battery_info}%\n")
+
+        # Add signal quality information
+        device_info_text.append(f"Signal Quality: ", style="bold")
+        quality = device.signal_quality
+        quality_style = "green" if quality > 70 else "yellow" if quality > 40 else "red"
+        device_info_text.append(f"{quality:.1f}%\n", style=quality_style)
+
+        device_info_text.append(f"Signal Stability: ", style="bold")
+        stability = device.signal_stability
+        stability_style = (
+            "green" if stability < 3 else "yellow" if stability < 6 else "red"
+        )
+        device_info_text.append(f"{stability:.1f}\n", style=stability_style)
+
+        # Add first seen information
+        device_info_text.append(f"First Seen: ", style="bold")
+        first_seen_ago = time.time() - device.first_seen
+        device_info_text.append(f"{format_time_ago(first_seen_ago)} ago\n")
+
+        # Create tracker info if relevant
+        if device.is_airtag:
+            device_info_text.append("\n◉ Tracker Information\n\n", style="bold red")
+            tracker_type = device.get_tracker_type()
+            device_info_text.append("Type: ", style="bold")
+            device_info_text.append(f"{tracker_type}\n", style="red")
+
+            # Get confidence level
+            if hasattr(device, "tracker_confidence"):
+                confidence_levels = {
+                    TRACKING_CONFIDENCE["CONFIRMED"]: ("Confirmed", "bright_red"),
+                    TRACKING_CONFIDENCE["HIGH"]: ("High", "red"),
+                    TRACKING_CONFIDENCE["MEDIUM"]: ("Medium", "yellow"),
+                    TRACKING_CONFIDENCE["LOW"]: ("Low", "blue"),
+                    TRACKING_CONFIDENCE["UNLIKELY"]: ("Unlikely", "blue"),
+                }
+                confidence_level, confidence_style = confidence_levels.get(
+                    device.tracker_confidence, ("Unknown", "red")
+                )
+                device_info_text.append(f"Confidence: ", style="bold")
+                device_info_text.append(f"{confidence_level}\n", style=confidence_style)
+
+        device_info_panel = Panel(
+            device_info_text,
+            title="Device Info",
+            style="bold cyan",
+            border_style="cyan",
+            box=ROUNDED,
+        )
+        layout["device_info"].update(device_info_panel)
+
+        # Get detailed proximity analysis
+        proximity_analysis = device.get_detailed_proximity_analysis()
+
+        # Create distance gauge panel - a visual representation of distance
+        distance = device.distance
+        gauge_text = Text()
+
+        # Create an enhanced visual distance gauge with more real-time information
+        gauge_text.append("\n")
+        gauge_text.append("Current Distance:", style="bold cyan")
+
+        # Distance with units display
+        if distance < 1:
+            gauge_text.append(
+                f" {distance:.2f}m ({distance*100:.0f}cm)\n\n", style="bold green"
+            )
+        elif distance < 3:
+            gauge_text.append(f" {distance:.2f}m\n\n", style="bold yellow")
+        else:
+            gauge_text.append(f" {distance:.2f}m\n\n", style="bold red")
+
+        # Visual gauge - different representation based on distance
+        if distance <= 10:  # Only show gauge for distances under 10m
+            gauge_width = 48  # Wider gauge for better visualization
+            filled_chars = min(
+                int((10 - min(distance, 10)) / 10 * gauge_width), gauge_width
+            )
+            empty_chars = gauge_width - filled_chars
+
+            # Color coding based on distance
+            if distance < 1:
+                color = "green"
+            elif distance < 3:
+                color = "yellow"
+            else:
+                color = "red"
+
+            gauge_text.append("0m ")
+            gauge_text.append("█" * filled_chars, style=f"bold {color}")
+            gauge_text.append("░" * empty_chars, style="dim")
+            gauge_text.append(" 10m\n\n")
+
+            # Add real-time signal information section
+            gauge_text.append("Signal Information\n", style="bold cyan")
+
+            # Current RSSI with timestamp
+            rssi_time = time.strftime("%H:%M:%S.%f")[:-3]
+            gauge_text.append(f"RSSI: ", style="bold")
+
+            # Color-code RSSI
+            rssi_style = (
+                "green"
+                if device.rssi > -70
+                else "yellow" if device.rssi > -85 else "red"
+            )
+            gauge_text.append(f"{device.rssi} dBm", style=rssi_style)
+            gauge_text.append(f" (at {rssi_time})\n")
+
+            # Add smoothed RSSI
+            gauge_text.append(f"Smoothed RSSI: ", style="bold")
+            smooth_rssi_style = (
+                "green"
+                if device.smooth_rssi > -70
+                else "yellow" if device.smooth_rssi > -85 else "red"
+            )
+            gauge_text.append(
+                f"{device.smooth_rssi:.1f} dBm\n", style=smooth_rssi_style
+            )
+
+            # Add calibration parameters
+            gauge_text.append(f"RSSI@1m: ", style="bold")
+            gauge_text.append(f"{device.calibrated_rssi_at_one_meter} dBm\n")
+
+            gauge_text.append(f"Env factor: ", style="bold")
+            gauge_text.append(f"{device.calibrated_n_value:.2f}\n")
+
+            # Signal quality
+            gauge_text.append(f"Quality: ", style="bold")
+            quality = device.signal_quality
+            quality_style = (
+                "green" if quality > 70 else "yellow" if quality > 40 else "red"
+            )
+            gauge_text.append(f"{quality:.1f}%\n\n", style=quality_style)
+
+            # Show real-time distance changes with more detail
+            gauge_text.append("Distance Trend\n", style="bold cyan")
+
+            if (
+                hasattr(device, "previous_distance")
+                and device.previous_distance is not None
+            ):
+                delta = distance - device.previous_distance
+                if abs(delta) >= 0.01:  # Only show meaningful changes
+                    delta_text = f"{abs(delta):.2f}m"
+                    delta_pct = abs(delta / max(device.previous_distance, 0.1)) * 100
+
+                    if delta < 0:
+                        gauge_text.append(f"Direction: ", style="bold")
+                        gauge_text.append(f"▼ Closer ", style="bold green")
+                        gauge_text.append(f"({delta_pct:.1f}% change)\n", style="green")
+
+                        # Show rate of approach
+                        time_diff = time.time() - device.last_trend_update
+                        if time_diff > 0:
+                            approach_rate = abs(delta) / time_diff
+                            gauge_text.append(f"Speed: ", style="bold")
+                            gauge_text.append(
+                                f"{approach_rate:.2f} m/s\n", style="green"
+                            )
+                    else:
+                        gauge_text.append(f"Direction: ", style="bold")
+                        gauge_text.append(f"▲ Further ", style="bold red")
+                        gauge_text.append(f"({delta_pct:.1f}% change)\n", style="red")
+
+                        # Show rate of movement away
+                        time_diff = time.time() - device.last_trend_update
+                        if time_diff > 0:
+                            away_rate = abs(delta) / time_diff
+                            gauge_text.append(f"Speed: ", style="bold")
+                            gauge_text.append(f"{away_rate:.2f} m/s\n", style="red")
+                else:
+                    gauge_text.append(f"Direction: ", style="bold")
+                    gauge_text.append(f"◆ Stable\n", style="bold yellow")
+
+                # Show historical distance changes if available
+                if (
+                    hasattr(device, "distance_trend")
+                    and len(device.distance_trend) >= 3
+                ):
+                    # Get last few distance points
+                    recent_distances = [d for _, d, _, _ in device.distance_trend[-3:]]
+                    gauge_text.append(f"Recent values: ", style="bold")
+                    gauge_text.append(
+                        f"{', '.join([f'{d:.2f}m' for d in recent_distances])}\n"
+                    )
+        else:
+            # For long distances, show simple text
+            gauge_text.append("Distance too large for visual gauge\n", style="yellow")
+            gauge_text.append(f"RSSI: ", style="bold")
+            gauge_text.append(f"{device.rssi} dBm\n", style="red")
+
+        distance_panel = Panel(
+            gauge_text,
+            title="Distance Gauge",
+            style="bold green",
+            border_style="green",
+            box=ROUNDED,
+        )
+        layout["distance_gauge"].update(distance_panel)
+
+        # Create enhanced trend analysis panel with more visuals
+        trend_text = Text()
+        trend_text.append("\n")
+
+        status = proximity_analysis.get("status", "unknown")
+
+        if status == "initializing":
+            trend_text.append("Initializing trend analysis...\n", style="yellow")
+            trend_text.append("\nMove around to establish tracking data.")
+        else:
+            # Show the direction trend visually with real-time timestamp
+            direction = proximity_analysis.get("direction", "unknown")
+            confidence = proximity_analysis.get("confidence", 0.0)
+            current_time = time.strftime("%H:%M:%S.%f")[:-3]
+
+            # Visual trend indicator
+            trend_text.append("Movement Trend: ", style="bold cyan")
+            if direction == "closer":
+                trend_text.append("▼ GETTING CLOSER\n", style="bold green")
+            elif direction == "further":
+                trend_text.append("▲ MOVING AWAY\n", style="bold red")
+            else:
+                trend_text.append("◆ STABLE\n", style="bold yellow")
+            trend_text.append(f"Updated at: {current_time}\n\n")
+
+            # Add confidence meter with improved visualization
+            trend_text.append("Confidence: ", style="bold cyan")
+            confidence_bar = "█" * int(confidence * 10)
+            empty_bar = "░" * (10 - int(confidence * 10))
+            if confidence > 0.7:
+                confidence_color = "green"
+            elif confidence > 0.4:
+                confidence_color = "yellow"
+            else:
+                confidence_color = "red"
+            trend_text.append(f"{confidence_bar}", style=f"bold {confidence_color}")
+            trend_text.append(f"{empty_bar}", style="dim")
+            trend_text.append(f" {confidence*100:.0f}%\n\n")
+
+            # Show detailed prediction with improved formatting
+            trend_text.append("Analysis:\n", style="bold cyan")
+            analysis_message = proximity_analysis.get("message", "")
+
+            # Apply different styles based on message content
+            if "getting closer" in analysis_message.lower():
+                trend_text.append(f"{analysis_message}\n\n", style="green")
+            elif "moving away" in analysis_message.lower():
+                trend_text.append(f"{analysis_message}\n\n", style="red")
+            else:
+                trend_text.append(f"{analysis_message}\n\n")
+
+            # Add prediction visualization
+            prediction = proximity_analysis.get("prediction", {})
+            if prediction and "distance" in prediction:
+                predicted_distance = prediction["distance"]
+                prediction_time = prediction.get("time", 5.0)
+
+                trend_text.append("Prediction:\n", style="bold cyan")
+                trend_text.append(f"In {prediction_time} seconds: ", style="bold")
+
+                if predicted_distance < distance:
+                    pred_style = "green"
+                    pred_prefix = "▼ "
+                elif predicted_distance > distance:
+                    pred_style = "red"
+                    pred_prefix = "▲ "
+                else:
+                    pred_style = "yellow"
+                    pred_prefix = "◆ "
+
+                trend_text.append(
+                    f"{pred_prefix}{predicted_distance:.2f}m\n", style=pred_style
+                )
+
+                # Show distance change prediction
+                distance_change = predicted_distance - distance
+                pct_change = (distance_change / max(distance, 0.1)) * 100
+
+                if abs(distance_change) > 0.01:
+                    trend_text.append("Expected change: ", style="bold")
+                    if distance_change < 0:
+                        trend_text.append(
+                            f"{distance_change:.2f}m ({pct_change:.1f}%)\n\n",
+                            style="green",
+                        )
+                    else:
+                        trend_text.append(
+                            f"+{distance_change:.2f}m (+{pct_change:.1f}%)\n\n",
+                            style="red",
+                        )
+                else:
+                    trend_text.append("Expected change: ", style="bold")
+                    trend_text.append("minimal\n\n", style="yellow")
+
+            # Show technical details for advanced users with more information
+            trend_text.append("Technical Details:\n", style="bold cyan")
+            rate = proximity_analysis.get("rate", 0.0)
+            rate_abs = abs(rate)
+
+            # Rate of change with intuitive description
+            trend_text.append("Rate of change: ", style="bold")
+            if rate < 0:
+                speed_desc = (
+                    "very fast"
+                    if rate_abs > 0.5
+                    else (
+                        "fast"
+                        if rate_abs > 0.2
+                        else "moderate" if rate_abs > 0.1 else "slow"
+                    )
+                )
+                trend_text.append(
+                    f"{rate:.2f} m/s (approaching {speed_desc})\n", style="green"
+                )
+            elif rate > 0:
+                speed_desc = (
+                    "very fast"
+                    if rate_abs > 0.5
+                    else (
+                        "fast"
+                        if rate_abs > 0.2
+                        else "moderate" if rate_abs > 0.1 else "slow"
+                    )
+                )
+                trend_text.append(
+                    f"{rate:.2f} m/s (receding {speed_desc})\n", style="red"
+                )
+            else:
+                trend_text.append(f"{rate:.2f} m/s (stable)\n", style="yellow")
+
+            # Show current data points used for analysis
+            data_points = proximity_analysis.get("data_points", 0)
+            trend_text.append("Data points: ", style="bold")
+            trend_text.append(f"{data_points}\n")
+
+            # Calculate and show estimated time to reach device if approaching
+            if direction == "closer" and rate_abs > 0.01:
+                time_to_reach = device.distance / rate_abs
+                if time_to_reach < 120:  # Only show if less than 2 minutes
+                    trend_text.append("ETA: ", style="bold")
+                    # Format time to reach in a more user-friendly way
+                    if time_to_reach < 10:
+                        trend_text.append(f"{time_to_reach:.1f}s\n", style="bold green")
+                    elif time_to_reach < 30:
+                        trend_text.append(f"{time_to_reach:.1f}s\n", style="green")
+                    else:
+                        trend_text.append(
+                            f"{time_to_reach:.0f}s (~{time_to_reach/60:.1f}min)\n",
+                            style="yellow",
+                        )
+
+        trend_panel = Panel(
+            trend_text,
+            title="Trend Analysis",
+            style="bold magenta",
+            border_style="magenta",
+            box=ROUNDED,
+        )
+        layout["trend_analysis"].update(trend_panel)
+
+        # Create enhanced guidance panel with more real-time actionable advice
+        guidance_text = Text()
+        guidance_text.append("\n")
+
+        # Get guidance message
+        guidance_message = device.get_movement_guidance()
+
+        # Style based on distance
+        if device.distance < 0.5:
+            guidance_color = "bright_green"
+        elif device.distance < 2.0:
+            guidance_color = "green"
+        elif device.distance < 5.0:
+            guidance_color = "yellow"
+        else:
+            guidance_color = "red"
+
+        guidance_text.append(guidance_message, style=f"bold {guidance_color}")
+        guidance_text.append("\n\n")
+
+        # Add dynamic suggestions based on current trend and environment
+        trend_direction = ""
+        if hasattr(device, "distance_trend") and device.distance_trend:
+            _, _, direction, _ = device.distance_trend[-1]
+            trend_direction = direction
+
+        guidance_text.append("Current Suggestion:\n", style="bold cyan")
+
+        # Get the detailed analysis to determine next step
+        analysis = device.get_detailed_proximity_analysis()
+        confidence = analysis.get("confidence", 0)
+
+        if device.distance < 0.5:
+            # Very close - focused search
+            guidance_text.append(
+                "• Look around carefully at eye level\n", style="bright_green"
+            )
+            guidance_text.append(
+                "• Check pockets, bags, and nearby objects\n", style="bright_green"
+            )
+            guidance_text.append(
+                "• Try making the device play a sound if available\n",
+                style="bright_green",
+            )
+        elif trend_direction == "closer" and confidence > 0.5:
+            # Getting closer with good confidence
+            guidance_text.append("• Continue in the same direction\n", style="green")
+            guidance_text.append(
+                "• Increase movement speed for faster result\n", style="green"
+            )
+            guidance_text.append(
+                f"• Keep watching the RSSI ({device.rssi} dBm) to confirm progress\n",
+                style="green",
+            )
+        elif trend_direction == "further" and confidence > 0.5:
+            # Moving away with good confidence
+            guidance_text.append(
+                "• Stop and reverse direction immediately\n", style="red"
+            )
+            guidance_text.append(
+                "• Make larger movements to establish clear signal change\n",
+                style="red",
+            )
+            guidance_text.append(
+                "• Watch for signal strength improvement\n", style="red"
+            )
+        elif confidence < 0.4:
+            # Low confidence - need to establish baseline
+            guidance_text.append(
+                "• Move in large, deliberate steps (1-2m at a time)\n", style="yellow"
+            )
+            guidance_text.append(
+                "• Pause for 2-3 seconds after each movement\n", style="yellow"
+            )
+            guidance_text.append(
+                "• Try moving in a grid pattern to find the best signal\n",
+                style="yellow",
+            )
+        else:
+            # General advice
+            guidance_text.append(
+                "• Move deliberately in one direction at a time\n", style="cyan"
+            )
+            guidance_text.append("• Pause briefly after each movement\n", style="cyan")
+            guidance_text.append(
+                "• Watch signal strength to determine direction\n", style="cyan"
+            )
+
+        # Add environment-specific advice
+        guidance_text.append("\nEnvironment Tips:\n", style="bold cyan")
+
+        # Signal stability-based tips for the current environment
+        if device.signal_stability > 7:
+            # Very unstable signal - likely indoors with obstacles
+            guidance_text.append(
+                "• Signal is unstable (indoor/obstacles detected)\n", style="yellow"
+            )
+            guidance_text.append(
+                "• Move slowly and check multiple levels\n", style="yellow"
+            )
+            guidance_text.append(
+                "• Be aware of walls and metal objects causing reflections\n",
+                style="yellow",
+            )
+        elif device.signal_stability < 3:
+            # Stable signal - likely outdoors or line-of-sight
+            guidance_text.append(
+                "• Signal is stable (likely outdoor/clear area)\n", style="green"
+            )
+            guidance_text.append(
+                "• Trust the distance readings more precisely\n", style="green"
+            )
+            guidance_text.append(
+                "• Make larger movements to save time\n", style="green"
+            )
+
+        # Add Apple-specific tips for AirTags
+        if device.is_airtag and "Apple" in device.manufacturer:
+            guidance_text.append("\nAirTag-Specific:\n", style="bold cyan")
+            guidance_text.append(
+                "• Try using Find My app with Precision Finding\n", style="green"
+            )
+            guidance_text.append(
+                "• If available, use UWB direction finding\n", style="green"
+            )
+            guidance_text.append(
+                "• Try making the AirTag play a sound through Find My\n", style="green"
+            )
+
+        guidance_panel = Panel(
+            guidance_text,
+            title="Movement Guidance",
+            style="bold yellow",
+            border_style="yellow",
+            box=ROUNDED,
+        )
+        layout["guidance"].update(guidance_panel)
+
+        # Create footer with key controls
+        footer = Panel(
+            "[bold cyan]Controls:[/] [bold blue]q[/] - Quit scanning | [bold blue]b[/] - Back to device list",
+            border_style="blue",
+            box=SIMPLE,
+        )
+        layout["footer"].update(footer)
+
+        return layout
 
 
 if __name__ == "__main__":
