@@ -2673,6 +2673,7 @@ class TagFinder:
                     {
                         "mode": "passive",
                         "description": "Passive scanning (longer range)",
+                        "passive": True,  # Critical for passive scanning on Linux
                     },
                     {
                         "mode": "active",
@@ -2698,8 +2699,20 @@ class TagFinder:
 
                             # Update scanner parameters for this phase
                             scanner_kwargs["scanning_mode"] = phase["mode"]
-                            if "bluez" in scanner_kwargs and "interval" in phase:
-                                scanner_kwargs["bluez"]["interval"] = phase["interval"]
+
+                            # Update Linux-specific bluez parameters when mode changes
+                            if "bluez" in scanner_kwargs:
+                                # Handle passive scanning mode for Linux
+                                if "passive" in phase and phase["mode"] == "passive":
+                                    scanner_kwargs["bluez"]["passive"] = True
+                                else:
+                                    scanner_kwargs["bluez"]["passive"] = False
+
+                                # Update interval if specified
+                                if "interval" in phase:
+                                    scanner_kwargs["bluez"]["interval"] = phase[
+                                        "interval"
+                                    ]
 
                             self.console.print(
                                 f"[yellow]Phase {phase_idx+1}/{len(scan_phases)}: {phase['description']}[/]"
@@ -3429,7 +3442,7 @@ class TagFinder:
                     scanner_kwargs["adapter"] = adapter_address
 
                 # Configure scanner for maximum range
-                scanner_kwargs["scanning_mode"] = "active"
+                scanner_kwargs["scanning_mode"] = "active"  # Start with active scanning
                 scanner_kwargs["detection_callback"] = self.discovery_callback
                 scanner_kwargs["timeout"] = SCAN_PARAMETERS["timeout"]
 
@@ -3437,6 +3450,7 @@ class TagFinder:
                 if hasattr(bleak.backends, "bluezdbus") and sys.platform.startswith(
                     "linux"
                 ):
+                    # Configure BlueZ parameters - required for both active and passive scanning
                     scanner_kwargs["bluez"] = {
                         "interval": 0x0020,  # Aggressive scanning
                         "window": 0x0020,  # Maximize window
@@ -3466,7 +3480,12 @@ class TagFinder:
                 else:
                     scan_phases = [
                         {"mode": "active", "description": "Active scanning"},
-                        {"mode": "passive", "description": "Passive scanning"},
+                        # For Linux, always include bluez passive parameter when using passive mode
+                        {
+                            "mode": "passive",
+                            "description": "Passive scanning",
+                            "passive": True,  # This is critical for passive scanning on Linux
+                        },
                     ]
 
                 # Progress indicator
@@ -3475,7 +3494,23 @@ class TagFinder:
 
                 # Scan with each phase
                 for phase_idx, phase in enumerate(scan_phases):
+                    # Update scanning mode
                     scanner_kwargs["scanning_mode"] = phase["mode"]
+
+                    # For Linux, update bluez parameters when mode changes
+                    if hasattr(bleak.backends, "bluezdbus") and sys.platform.startswith(
+                        "linux"
+                    ):
+                        if "passive" in phase and phase["mode"] == "passive":
+                            # Ensure bluez parameter is set correctly for passive scanning
+                            scanner_kwargs["bluez"]["passive"] = True
+                        else:
+                            # Active scanning
+                            scanner_kwargs["bluez"]["passive"] = False
+
+                        # Update interval if specified in the phase
+                        if "interval" in phase:
+                            scanner_kwargs["bluez"]["interval"] = phase["interval"]
 
                     # Create and start scanner
                     scanner = BleakScanner(**scanner_kwargs)
