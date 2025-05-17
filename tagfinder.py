@@ -1383,9 +1383,7 @@ class TagFinder:
         details_text.append("\n◉ ", style="bold green")
         details_text.append("Available Actions", style="bold yellow")
         details_text.append("\n")
-        details_text.append("  [C] ", style="bold cyan")
-        details_text.append("Calibrate\n")
-        details_text.append("  [B] ", style="bold cyan")
+        details_text.append("  [b] ", style="bold cyan")
         details_text.append("Back to device list\n")
 
         # Return the details panel
