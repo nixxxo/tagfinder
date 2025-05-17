@@ -71,6 +71,7 @@ current_settings = {
     "show_extra_columns": True,  # Show additional information columns
     "highlight_new_devices": True,  # Highlight devices seen for the first time
     "auto_save_devices": True,  # Automatically save discovered devices
+    "selected_adapter": None,  # Selected Bluetooth adapter for scanning
 }
 
 # Dictionary to store friendly names for devices
@@ -871,6 +872,11 @@ async def scan_once():
     # Get terminal dimensions for better layout
     terminal_width, terminal_height = shutil.get_terminal_size()
 
+    # Get adapter name for display
+    adapter_name = "Default (System Choice)"
+    if current_settings["selected_adapter"]:
+        adapter_name = current_settings["selected_adapter"]
+
     # Create a nice looking scan screen
     scan_mode = (
         "Continuous scan" if not current_settings["scan_once"] else "Single scan"
@@ -882,6 +888,7 @@ Mode: {scan_mode}
 AirTag filter: {'ON' if current_settings['airtags_only'] else 'OFF'}
 TX Power: {current_settings['tx_power']} dBm
 Path Loss: {current_settings['path_loss']}
+Using adapter: [cyan]{adapter_name}[/cyan]
 
 [dim]Press 'q' to stop scanning and return to menu[/dim]
 """
@@ -891,7 +898,13 @@ Path Loss: {current_settings['path_loss']}
     found_devices = []
     scan_running = True
 
-    # Setup scanner with the callback function
+    # Determine adapter settings for different platforms
+    adapter_kwargs = {}
+    if platform.system() == "Linux" and current_settings["selected_adapter"]:
+        # On Linux, the adapter parameter is the name like "hci0", "hci1", etc.
+        adapter_kwargs = {"adapter": current_settings["selected_adapter"]}
+
+    # Setup scanner with the callback function and adapter
     scanner = BleakScanner(
         detection_callback=lambda d, ad: device_callback(
             d,
@@ -899,7 +912,8 @@ Path Loss: {current_settings['path_loss']}
             current_settings["airtags_only"],
             current_settings["tx_power"],
             current_settings["path_loss"],
-        )
+        ),
+        **adapter_kwargs,
     )
 
     return await _run_scan(scanner)
@@ -921,11 +935,18 @@ async def _run_scan(scanner):
                 if i == 0 or i == current_settings["duration"] - 1 or i % 2 == 0:
                     clear_screen()
                     progress = f"{i+1}/{current_settings['duration']} seconds"
+
+                    # Get adapter name for display
+                    adapter_name = "Default (System Choice)"
+                    if current_settings["selected_adapter"]:
+                        adapter_name = current_settings["selected_adapter"]
+
                     status_text = f"""[bold cyan]Scanning for Bluetooth devices...[/bold cyan]
 
 Progress: {progress}
 Mode: Single scan
 AirTag filter: {'ON' if current_settings['airtags_only'] else 'OFF'}
+Using adapter: [cyan]{adapter_name}[/cyan]
 
 [dim]Press 'q' to cancel scan[/dim]
 """
@@ -947,12 +968,19 @@ AirTag filter: {'ON' if current_settings['airtags_only'] else 'OFF'}
                 # Update display every 2 seconds
                 if scan_time % 2 == 0:
                     clear_screen()
+
+                    # Get adapter name for display
+                    adapter_name = "Default (System Choice)"
+                    if current_settings["selected_adapter"]:
+                        adapter_name = current_settings["selected_adapter"]
+
                     status_text = f"""[bold cyan]Scanning for Bluetooth devices...[/bold cyan]
 
 Running time: {scan_time} seconds
 Mode: Continuous scan
 AirTag filter: {'ON' if current_settings['airtags_only'] else 'OFF'}
 Devices found: {len(found_devices)}
+Using adapter: [cyan]{adapter_name}[/cyan]
 
 [bold green]Press 'q' to stop scanning and return to menu[/bold green]
 """
@@ -1031,6 +1059,11 @@ def display_help():
         Layout(name="help"),
     )
 
+    # Get adapter display name
+    adapter_display = "Default (System Choice)"
+    if current_settings["selected_adapter"]:
+        adapter_display = current_settings["selected_adapter"]
+
     # Commands section
     commands_table = Table.grid(padding=1)
     commands_table.add_column(style="green bold", justify="center")
@@ -1052,6 +1085,9 @@ def display_help():
         f"Toggle scan mode ({'SINGLE' if current_settings['scan_once'] else 'CONTINUOUS'})",
     )
     commands_table.add_row("l", "List Bluetooth adapters")
+    commands_table.add_row(
+        "b", f"Select Bluetooth adapter (Current: {adapter_display})"
+    )
     commands_table.add_row("c", "Clear device list")
     commands_table.add_row("h", "Show this help")
     commands_table.add_row("q", "Quit the application")
@@ -1090,6 +1126,12 @@ Path loss exponent varies by environment:
 • 2.0: Free space / outdoors
 • 2.5: Mixed environment (default)
 • 3.0-4.0: Indoor with obstacles
+
+[bold cyan]Bluetooth Adapters:[/bold cyan]
+• If your system has multiple Bluetooth adapters, you can
+  select which one to use for scanning.
+• Linux users can specify adapters like "hci0", "hci1", etc.
+• The default option uses the system's primary adapter.
 """
 
     content_layout["help"].update(
@@ -1353,6 +1395,11 @@ def display_menu():
     menu_grid.add_column(style="dim", justify="right")
     menu_grid.add_column(style="cyan")
 
+    # Format adapter name for display
+    adapter_display = "Default (System Choice)"
+    if current_settings["selected_adapter"]:
+        adapter_display = current_settings["selected_adapter"]
+
     # Add a row for each command with settings on the right
     menu_grid.add_row(
         "s",
@@ -1395,6 +1442,12 @@ def display_menu():
         "List Adapters",
         "Auto Save:",
         "ON" if current_settings["auto_save_devices"] else "OFF",
+    )
+    menu_grid.add_row(
+        "b",
+        "Select Adapter",
+        "BT Adapter:",
+        adapter_display,
     )
     menu_grid.add_row(
         "c",
@@ -1774,6 +1827,9 @@ async def main_interactive():
                 elif key == "l":  # List adapters
                     display_bluetooth_adapters()
 
+                elif key == "b":  # Select Bluetooth adapter
+                    select_bluetooth_adapter()
+
                 elif key == "c":  # Clear devices
                     found_devices.clear()
 
@@ -1878,6 +1934,111 @@ def initialize_app():
     clear_screen()
 
 
+def select_bluetooth_adapter():
+    """Allow the user to select a Bluetooth adapter from the available ones."""
+    global current_settings
+
+    clear_screen()
+    console.print("\n[bold cyan]Select Bluetooth Adapter[/bold cyan]\n")
+
+    adapters = get_bluetooth_adapters()
+
+    if not adapters:
+        console.print(
+            "[yellow]No Bluetooth adapters found or unable to detect adapters.[/yellow]"
+        )
+        console.print(
+            "[dim]Note: You may need administrator/root privileges to see all adapter details.[/dim]"
+        )
+        console.print("\n[dim]Press any key to return to the main menu...[/dim]")
+        while not is_key_pressed():
+            time.sleep(0.1)
+        get_key()
+        return
+
+    # Create a table to display adapter information
+    table = Table(
+        title=f"Available Bluetooth Adapters ({platform.system()})", box=box.ROUNDED
+    )
+    table.add_column("#", style="cyan", no_wrap=True, width=3)
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("MAC Address", style="magenta")
+    table.add_column("Manufacturer", style="green")
+    table.add_column("Version/ID", style="yellow")
+    table.add_column("Powered", style="blue")
+
+    # Add each adapter to the table with an index
+    for idx, adapter in enumerate(adapters):
+        name = adapter.get("name", "N/A")
+        address = adapter.get("address", "N/A")
+        manufacturer = adapter.get("manufacturer", "N/A")
+        version = adapter.get("version", adapter.get("device_id", "N/A"))
+        power_state = adapter.get("powered", "N/A")
+
+        # Format power state with color
+        power_text = Text(power_state)
+        if "On" in power_state or "OK" in power_state or "Yes" in power_state:
+            power_text.stylize("bold green")
+        elif "Off" in power_state or "No" in power_state or "Down" in power_state:
+            power_text.stylize("bold red")
+
+        is_selected = (
+            "[bright_green]✓[/bright_green] "
+            if current_settings["selected_adapter"] == adapter.get("name", "N/A")
+            else ""
+        )
+        display_index = f"{idx + 1}"
+        table.add_row(
+            display_index,
+            f"{is_selected}{name}",
+            address,
+            manufacturer,
+            version,
+            power_text,
+        )
+
+    # Add an option to use the system default adapter
+    table.add_row("0", "[dim]Default Adapter (System Choice)[/dim]", "", "", "", "")
+
+    console.print(table)
+
+    # Get adapter selection from user
+    console.print(
+        "\nEnter the number of the adapter to use (0 for default), or press Enter to cancel: ",
+        end="",
+    )
+    choice = input().strip()
+
+    if not choice:
+        return
+
+    try:
+        idx = int(choice)
+        if idx == 0:
+            # Use system default (None)
+            current_settings["selected_adapter"] = None
+            console.print("[green]✓ Using system default adapter.[/green]")
+        elif 1 <= idx <= len(adapters):
+            # Use selected adapter
+            selected = adapters[idx - 1]
+            adapter_name = selected.get("name", "N/A")
+            current_settings["selected_adapter"] = adapter_name
+            console.print(f"[green]✓ Selected adapter: {adapter_name}[/green]")
+        else:
+            console.print("[red]Invalid adapter number.[/red]")
+
+    except ValueError:
+        console.print("[red]Please enter a valid number.[/red]")
+
+    # Save the settings
+    save_settings()
+
+    console.print("\n[dim]Press any key to return to the main menu...[/dim]")
+    while not is_key_pressed():
+        time.sleep(0.1)
+    get_key()  # Consume the key
+
+
 if __name__ == "__main__":
     try:
         # Initialize the application
@@ -1927,6 +2088,11 @@ if __name__ == "__main__":
                 default=DEFAULT_PATH_LOSS_EXPONENT,
                 help=f"Path loss exponent for distance calculation (default: {DEFAULT_PATH_LOSS_EXPONENT}).",
             )
+            parser.add_argument(
+                "--adapter",
+                type=str,
+                help="Specify which Bluetooth adapter to use (e.g., 'hci0' on Linux).",
+            )
 
             args = parser.parse_args()
 
@@ -1935,6 +2101,8 @@ if __name__ == "__main__":
             current_settings["tx_power"] = args.tx_power
             current_settings["path_loss"] = args.path_loss
             current_settings["duration"] = args.duration
+            if args.adapter:
+                current_settings["selected_adapter"] = args.adapter
 
             # Run in CLI mode
             if args.list_adapters:
