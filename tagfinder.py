@@ -63,6 +63,12 @@ FIND_MY_UUIDS = [
     "7DFC9002",
     "7DFC9003",
     "74278BDA-B644-4520-8F0C-720EAF059935",
+    "74278BDA-B644",
+    "FD-44",
+    "D0611E78",
+    "9FA480E0",
+    "FD5A",
+    "8667556C",
 ]  # Apple and other tracker related UUIDs
 SCAN_INTERVAL = 0.5  # Scan interval in seconds (reduced for more frequent updates)
 DEFAULT_RSSI_AT_ONE_METER = -59  # Default RSSI at 1 meter for Bluetooth LE
@@ -237,6 +243,17 @@ TRACKING_DEVICE_TYPES = {
     },
 }
 
+# Add more confidence levels to tracker detection
+TRACKING_CONFIDENCE = {"CONFIRMED": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNLIKELY": 4}
+
+# Add detection patterns for Apple Find My network
+FIND_MY_DATA_PATTERNS = [
+    {"offset": 0, "value": 0x12, "mask": 0xFF},  # First byte 0x12
+    {"offset": 1, "value": 0x19, "mask": 0xFF},  # Second byte 0x19
+    {"offset": 0, "value": 0x10, "mask": 0xFF},  # First byte 0x10 (alternate pattern)
+    {"offset": 0, "value": 0x0F, "mask": 0xFF},  # First byte 0x0F (another pattern)
+]
+
 
 class Device:
     def __init__(
@@ -259,6 +276,7 @@ class Device:
         self.first_seen = time.time()
         self.last_seen = time.time()
         self.is_airtag = self._check_if_airtag()
+        self.tracker_confidence = self._calculate_tracker_confidence()
         self.calibrated_n_value = DEFAULT_DISTANCE_N_VALUE
         self.calibrated_rssi_at_one_meter = DEFAULT_RSSI_AT_ONE_METER
         self.is_new = is_new  # Flag to mark if this is a newly discovered device
@@ -287,6 +305,10 @@ class Device:
         if is_new is not None:
             self.is_new = is_new
         self.last_seen = time.time()
+
+        # Recalculate tracker detection with new data
+        self.is_airtag = self._check_if_airtag()
+        self.tracker_confidence = self._calculate_tracker_confidence()
 
         # Update extracted information
         self.manufacturer = self._extract_manufacturer()
@@ -469,12 +491,27 @@ class Device:
         # Next, prioritize critical tracking device information
         if self.is_airtag:
             tracker_type = self.get_tracker_type()
+
+            # Add confidence indicator to tracker type
+            confidence_indicators = {
+                TRACKING_CONFIDENCE["CONFIRMED"]: "✓",  # Confirmed
+                TRACKING_CONFIDENCE["HIGH"]: "!",  # High confidence
+                TRACKING_CONFIDENCE["MEDIUM"]: "?",  # Medium confidence
+                TRACKING_CONFIDENCE["LOW"]: "??",  # Low confidence
+                TRACKING_CONFIDENCE["UNLIKELY"]: "",  # Unlikely/No indicator
+            }
+
+            confidence_icon = confidence_indicators.get(self.tracker_confidence, "")
+
             if (
                 tracker_type != "Not a tracker"
                 and "Find My Network" not in details
                 and "AirTag" not in details
             ):
-                details.append(f"⚠️ {tracker_type}")
+                if self.tracker_confidence <= TRACKING_CONFIDENCE["HIGH"]:
+                    details.append(f"⚠️ {tracker_type} {confidence_icon}")
+                else:
+                    details.append(f"🔍 Possible {tracker_type} {confidence_icon}")
 
         # Parse Apple specific data
         if 76 in self.manufacturer_data:
@@ -641,7 +678,7 @@ class Device:
         return ""
 
     def _check_if_airtag(self) -> bool:
-        """Check if device is potentially an AirTag or other tracking device"""
+        """Check if device is potentially an AirTag or other tracking device with enhanced detection"""
         # Store verification flags with confidence levels
         evidence = {
             "name_match": False,
@@ -650,6 +687,7 @@ class Device:
             "airtag_pattern": False,
             "known_uuid": False,
             "service_data": False,
+            "nearby_interaction": False,
         }
 
         # Check manufacturer first - must be Apple for AirTags
@@ -661,39 +699,46 @@ class Device:
 
             # Only proceed with pattern matching if we have enough data
             if len(data) > 2:
+                # Check all known Find My patterns
+                for pattern in FIND_MY_DATA_PATTERNS:
+                    offset = pattern["offset"]
+                    value = pattern["value"]
+                    mask = pattern["mask"]
+
+                    if offset < len(data) and (data[offset] & mask) == value:
+                        evidence["find_my_pattern"] = True
+                        break
+
                 # Exact Find My network pattern (highest confidence)
-                if data[0] == 0x12 and data[1] == 0x19:
+                if len(data) > 1 and data[0] == 0x12 and data[1] == 0x19:
                     evidence["find_my_pattern"] = True
 
                     # Exact AirTag identifier pattern
                     if len(data) > 3 and data[2] & 0x0F == 0x0A:  # AirTag type is 0x0A
                         evidence["airtag_pattern"] = True
 
-        # If name contains clear AirTag identifiers (but only specific ones, not general terms)
-        if self.name and (
-            "airtag" in self.name.lower()
-            or "find my" in self.name.lower()
-            or "apple tag" in self.name.lower()
+                # Check for Nearby Interaction protocol (also used by Find My)
+                if len(data) > 2 and data[0] == 0x0F:
+                    evidence["nearby_interaction"] = True
+
+        # If name contains clear AirTag identifiers
+        if self.name and any(
+            identifier in self.name.lower() for identifier in AIRTAG_IDENTIFIERS
         ):
             evidence["name_match"] = True
 
         # Check for Find My Network specific UUIDs (high confidence indicators)
-        high_confidence_uuids = [
-            "7DFC9000",
-            "7DFC9001",
-            "0000FD44",
-            "74278BDA-B644-4520-8F0C-720EAF059935",
-        ]
         for uuid in self.service_uuids:
             uuid_upper = uuid.upper()
-            for find_my_id in high_confidence_uuids:
+            for find_my_id in FIND_MY_UUIDS:
                 if find_my_id in uuid_upper:
                     evidence["known_uuid"] = True
                     break
 
         # Check for specific service data patterns related to Find My network
         for service_uuid, _ in self.service_data.items():
-            if service_uuid.upper() in ["7DFC9000", "7DFC9001", "0000FD44"]:
+            service_uuid_upper = service_uuid.upper()
+            if any(find_my_id in service_uuid_upper for find_my_id in FIND_MY_UUIDS):
                 evidence["service_data"] = True
                 break
 
@@ -701,18 +746,26 @@ class Device:
 
         # Definite AirTag/Find My device (extremely high confidence)
         if (
-            evidence["apple_manufacturer"]
-            and (evidence["find_my_pattern"] or evidence["airtag_pattern"])
-        ) or (
-            evidence["apple_manufacturer"]
-            and evidence["known_uuid"]
-            and evidence["name_match"]
+            (evidence["apple_manufacturer"] and evidence["find_my_pattern"])
+            or (evidence["apple_manufacturer"] and evidence["airtag_pattern"])
+            or (
+                evidence["apple_manufacturer"]
+                and evidence["known_uuid"]
+                and evidence["name_match"]
+            )
+            or (
+                evidence["apple_manufacturer"]
+                and evidence["nearby_interaction"]
+                and evidence["known_uuid"]
+            )
         ):
             return True
 
         # High confidence Find My device
-        if (evidence["apple_manufacturer"] and evidence["known_uuid"]) or (
-            evidence["apple_manufacturer"] and evidence["service_data"]
+        if (
+            (evidence["apple_manufacturer"] and evidence["known_uuid"])
+            or (evidence["apple_manufacturer"] and evidence["service_data"])
+            or (evidence["name_match"] and evidence["known_uuid"])
         ):
             return True
 
@@ -728,22 +781,76 @@ class Device:
                     # For non-Apple devices, require exact UUID matches
                     for uuid in self.service_uuids:
                         uuid_upper = uuid.upper()
-                        exact_match = False
                         for tracker_uuid in tracker_info["uuids"]:
-                            if uuid_upper == tracker_uuid:
-                                exact_match = True
-                                break
-
-                        if exact_match:
-                            # Verify with name match for higher confidence
-                            if self.name and any(
-                                identifier in self.name.lower()
-                                for identifier in tracker_info["identifiers"]
-                            ):
-                                return True
+                            if tracker_uuid in uuid_upper:
+                                # Verify with name match for higher confidence
+                                if self.name and any(
+                                    identifier in self.name.lower()
+                                    for identifier in tracker_info["identifiers"]
+                                ):
+                                    return True
 
         # Default to false - require explicit evidence
         return False
+
+    def _calculate_tracker_confidence(self) -> int:
+        """Calculate confidence level for tracker detection (0 = confirmed, 4 = unlikely)"""
+        if not self.is_airtag:
+            return TRACKING_CONFIDENCE["UNLIKELY"]
+
+        # Count evidence points
+        evidence_points = 0
+
+        # Check manufacturer - Apple devices get points
+        if 76 in self.manufacturer_data:
+            evidence_points += 1
+
+            # Check for Find My pattern in manufacturer data
+            data = self.manufacturer_data[76]
+            if len(data) > 1:
+                if data[0] == 0x12 and data[1] == 0x19:  # Classic Find My pattern
+                    evidence_points += 3
+
+                # AirTag specific pattern
+                if len(data) > 2 and data[2] & 0x0F == 0x0A:
+                    evidence_points += 4
+
+                # Other Apple Find My patterns
+                if data[0] == 0x10 or data[0] == 0x0F:
+                    evidence_points += 2
+
+        # Check name for AirTag indicators
+        if self.name and any(
+            identifier in self.name.lower() for identifier in AIRTAG_IDENTIFIERS
+        ):
+            evidence_points += 2
+
+        # Check for Find My UUIDs
+        for uuid in self.service_uuids:
+            uuid_upper = uuid.upper()
+            for find_my_id in FIND_MY_UUIDS:
+                if find_my_id in uuid_upper:
+                    evidence_points += 2
+                    break
+
+        # Check for Find My service data
+        for service_uuid, _ in self.service_data.items():
+            service_uuid_upper = service_uuid.upper()
+            if any(find_my_id in service_uuid_upper for find_my_id in FIND_MY_UUIDS):
+                evidence_points += 2
+                break
+
+        # Determine confidence level based on evidence points
+        if evidence_points >= 7:
+            return TRACKING_CONFIDENCE["CONFIRMED"]
+        elif evidence_points >= 5:
+            return TRACKING_CONFIDENCE["HIGH"]
+        elif evidence_points >= 3:
+            return TRACKING_CONFIDENCE["MEDIUM"]
+        elif evidence_points >= 1:
+            return TRACKING_CONFIDENCE["LOW"]
+        else:
+            return TRACKING_CONFIDENCE["UNLIKELY"]
 
     def get_tracker_type(self) -> str:
         """Identify the specific type of tracking device"""
@@ -1038,6 +1145,7 @@ class Device:
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "is_airtag": self.is_airtag,
+            "tracker_confidence": self.tracker_confidence,
             "is_new": getattr(self, "is_new", False),
             "distance": self.distance,
             "calibrated_n_value": self.calibrated_n_value,
@@ -1067,6 +1175,8 @@ class Device:
             device.calibrated_n_value = data["calibrated_n_value"]
         if "calibrated_rssi_at_one_meter" in data:
             device.calibrated_rssi_at_one_meter = data["calibrated_rssi_at_one_meter"]
+        if "tracker_confidence" in data:
+            device.tracker_confidence = data["tracker_confidence"]
         return device
 
 
@@ -1392,14 +1502,31 @@ class TagFinder:
             else:
                 rssi_color = "red"
 
-            # Color code for AirTags and Find My devices
+            # Color code for AirTags and Find My devices based on confidence
             tracker_type = (
                 device.get_tracker_type() if device.is_airtag else "Not a tracker"
             )
-            if device.is_airtag and "Apple AirTag" in tracker_type:
-                name_color = "bright_red"  # Highlight AirTags more prominently
-            elif device.is_airtag and "Find My" in tracker_type:
-                name_color = "bright_yellow"  # Find My devices in yellow
+
+            # Enhanced confidence-based color coding
+            if device.is_airtag:
+                if hasattr(device, "tracker_confidence"):
+                    # Use confidence level for coloring
+                    if device.tracker_confidence == TRACKING_CONFIDENCE["CONFIRMED"]:
+                        name_color = "bright_red"  # Confirmed trackers in bright red
+                    elif device.tracker_confidence == TRACKING_CONFIDENCE["HIGH"]:
+                        name_color = "red"  # High confidence in regular red
+                    elif device.tracker_confidence == TRACKING_CONFIDENCE["MEDIUM"]:
+                        name_color = "yellow"  # Medium confidence in yellow
+                    else:
+                        name_color = "blue"  # Low confidence in blue
+                else:
+                    # Backward compatibility with older data
+                    if "Apple AirTag" in tracker_type:
+                        name_color = "bright_red"
+                    elif "Find My" in tracker_type:
+                        name_color = "yellow"
+                    else:
+                        name_color = "blue"
             else:
                 name_color = "white"
 
@@ -1463,6 +1590,17 @@ class TagFinder:
                 name_display = Text(
                     f"{idx_display} {device.name}", style=f"{name_color} {style}"
                 )
+
+            # Add tracking indicator based on confidence
+            if device.is_airtag and hasattr(device, "tracker_confidence"):
+                if device.tracker_confidence == TRACKING_CONFIDENCE["CONFIRMED"]:
+                    name_display.append(" ⚠️", style="bold bright_red")
+                elif device.tracker_confidence == TRACKING_CONFIDENCE["HIGH"]:
+                    name_display.append(" ⚠️", style="bold red")
+                elif device.tracker_confidence == TRACKING_CONFIDENCE["MEDIUM"]:
+                    name_display.append(" 🔍", style="bold yellow")
+                elif device.tracker_confidence == TRACKING_CONFIDENCE["LOW"]:
+                    name_display.append(" ?", style="bold blue")
 
             # Build row data based on which columns are enabled
             row_data = [
@@ -1647,8 +1785,27 @@ class TagFinder:
         # Add tracker identification if it's a tracking device
         if device.is_airtag:
             tracker_type = device.get_tracker_type()
+
+            # Get confidence level if available
+            confidence_level = "Unknown"
+            confidence_style = "bold red"
+
+            if hasattr(device, "tracker_confidence"):
+                confidence_levels = {
+                    TRACKING_CONFIDENCE["CONFIRMED"]: ("Confirmed", "bold bright_red"),
+                    TRACKING_CONFIDENCE["HIGH"]: ("High Confidence", "bold red"),
+                    TRACKING_CONFIDENCE["MEDIUM"]: ("Medium Confidence", "bold yellow"),
+                    TRACKING_CONFIDENCE["LOW"]: ("Low Confidence", "bold blue"),
+                    TRACKING_CONFIDENCE["UNLIKELY"]: ("Unlikely", "bold blue"),
+                }
+                confidence_level, confidence_style = confidence_levels.get(
+                    device.tracker_confidence, ("Unknown", "bold red")
+                )
+
             details_text.append(f"  Tracker Type: ", style="bold red")
             details_text.append(f"{tracker_type}\n", style="bold red")
+            details_text.append(f"  Detection Confidence: ", style="bold")
+            details_text.append(f"{confidence_level}\n", style=confidence_style)
 
         # Signal Information section
         details_text.append("\n◉ ", style="bold green")
@@ -1729,7 +1886,7 @@ class TagFinder:
         details_text.append("Technical Details", style="bold yellow")
         details_text.append("\n")
 
-        # Service UUIDs
+        # Service UUIDs with improved Find My detection
         if device.service_uuids:
             truncated = len(device.service_uuids) > 5
             service_uuids = device.service_uuids[:5]  # Limit to first 5 UUIDs
@@ -1746,16 +1903,26 @@ class TagFinder:
                 details_text.append(f" +{len(device.service_uuids) - 5} more")
             details_text.append("\n")
 
-        # Manufacturer Data
+        # Manufacturer Data with improved Find My detection
         if device.manufacturer_data:
             details_text.append(f"  Manufacturer Data: ", style="bold")
             mfg_data_entries = []
             for company_id, data in device.manufacturer_data.items():
                 if company_id in COMPANY_IDENTIFIERS:
                     company_name = COMPANY_IDENTIFIERS[company_id]
-                    mfg_data_str = (
-                        f"{company_name} (0x{company_id:04X}): {data.hex()[:16]}"
-                    )
+                    # Highlight Apple data
+                    if company_id == 0x004C:  # Apple
+                        mfg_data_str = f"{company_name} (0x{company_id:04X}): "
+                        # Check if this is Find My data
+                        if len(data) > 1 and (data[0] == 0x12 and data[1] == 0x19):
+                            mfg_data_str += f"[bold red]{data.hex()[:16]}[/bold red]"
+                        else:
+                            mfg_data_str += f"{data.hex()[:16]}"
+                    else:
+                        mfg_data_str = (
+                            f"{company_name} (0x{company_id:04X}): {data.hex()[:16]}"
+                        )
+
                     if len(data.hex()) > 16:
                         mfg_data_str += "..."
                     mfg_data_entries.append(mfg_data_str)
@@ -1929,19 +2096,52 @@ class TagFinder:
                 f"[bold red]Security Warning:[/] {len(airtags)} tracking devices detected"
             )
 
-            # List the tracking devices
-            for i, device in enumerate(airtags[:3], 1):  # Show top 3
-                device_type = device.get("device_type", "Unknown Tracker")
-                last_seen_ago = now - device.get("last_seen", now)
-                summary_text.append(
-                    f"  {i}. [bold yellow]{device.get('name', 'Unnamed')}[/] - "
-                    f"{device_type} - Last seen {format_time_ago(last_seen_ago)} ago"
-                )
+            # Categorize trackers by confidence
+            confirmed_trackers = []
+            possible_trackers = []
 
-            if len(airtags) > 3:
-                summary_text.append(
-                    f"  ...and {len(airtags) - 3} more tracking devices"
+            for device in airtags:
+                confidence = device.get(
+                    "tracker_confidence", TRACKING_CONFIDENCE["MEDIUM"]
                 )
+                if confidence <= TRACKING_CONFIDENCE["HIGH"]:
+                    confirmed_trackers.append(device)
+                else:
+                    possible_trackers.append(device)
+
+            # List the confirmed tracking devices first
+            if confirmed_trackers:
+                summary_text.append(
+                    f"  [bold red]Confirmed Trackers: {len(confirmed_trackers)}[/]"
+                )
+                for i, device in enumerate(confirmed_trackers[:3], 1):  # Show top 3
+                    device_type = device.get("device_type", "Unknown Tracker")
+                    last_seen_ago = now - device.get("last_seen", now)
+                    summary_text.append(
+                        f"  {i}. [bold red]{device.get('name', 'Unnamed')}[/] - "
+                        f"{device_type} - Last seen {format_time_ago(last_seen_ago)} ago"
+                    )
+                if len(confirmed_trackers) > 3:
+                    summary_text.append(
+                        f"  ...and {len(confirmed_trackers) - 3} more confirmed trackers"
+                    )
+
+            # List possible tracking devices
+            if possible_trackers:
+                summary_text.append(
+                    f"  [bold yellow]Possible Trackers: {len(possible_trackers)}[/]"
+                )
+                for i, device in enumerate(possible_trackers[:2], 1):  # Show top 2
+                    device_type = device.get("device_type", "Unknown Tracker")
+                    last_seen_ago = now - device.get("last_seen", now)
+                    summary_text.append(
+                        f"  {i}. [bold yellow]{device.get('name', 'Unnamed')}[/] - "
+                        f"{device_type} - Last seen {format_time_ago(last_seen_ago)} ago"
+                    )
+                if len(possible_trackers) > 2:
+                    summary_text.append(
+                        f"  ...and {len(possible_trackers) - 2} more possible trackers"
+                    )
 
         # Create the panel
         summary = Panel(
@@ -2077,13 +2277,49 @@ class TagFinder:
         details_text.append(f"Manufacturer: ", style="bold")
         details_text.append(f"{device.manufacturer}\n")
 
-        # If it's a tracker, add a warning section
+        # If it's a tracker, add a warning section with confidence level
         if device.is_airtag:
             tracker_type = device.get_tracker_type()
+
+            # Get confidence level if available
+            confidence_level = "Unknown"
+            alert_style = "bold white on red"
+
+            if hasattr(device, "tracker_confidence"):
+                confidence_levels = {
+                    TRACKING_CONFIDENCE["CONFIRMED"]: (
+                        "CONFIRMED",
+                        "bold white on red",
+                    ),
+                    TRACKING_CONFIDENCE["HIGH"]: (
+                        "HIGH CONFIDENCE",
+                        "bold white on red",
+                    ),
+                    TRACKING_CONFIDENCE["MEDIUM"]: (
+                        "MEDIUM CONFIDENCE",
+                        "bold black on yellow",
+                    ),
+                    TRACKING_CONFIDENCE["LOW"]: (
+                        "LOW CONFIDENCE",
+                        "bold white on blue",
+                    ),
+                    TRACKING_CONFIDENCE["UNLIKELY"]: ("UNLIKELY", "bold white on blue"),
+                }
+                confidence_level, alert_style = confidence_levels.get(
+                    device.tracker_confidence, ("Unknown", "bold white on red")
+                )
+
             details_text.append("\n")
-            details_text.append(
-                "⚠️  TRACKING DEVICE DETECTED  ⚠️", style="bold white on red"
-            )
+            if device.tracker_confidence <= TRACKING_CONFIDENCE["HIGH"]:
+                details_text.append(
+                    f"⚠️  TRACKING DEVICE DETECTED - {confidence_level}  ⚠️",
+                    style=alert_style,
+                )
+            else:
+                details_text.append(
+                    f"🔍  POSSIBLE TRACKING DEVICE - {confidence_level}  🔍",
+                    style=alert_style,
+                )
             details_text.append("\n")
             details_text.append(f"Tracker Type: ", style="bold red")
             details_text.append(f"{tracker_type}\n", style="bold red")
@@ -2365,8 +2601,43 @@ class TagFinder:
         # Device is truly new if it's not in our scanning session and not in history
         is_truly_new = is_new_device and device.address not in known_addresses
 
-        # Skip extremely weak signals unless we're in extended range mode
-        if advertisement_data.rssi < DETECTION_THRESHOLD:
+        # Check for Find My identifiers to keep weak signals from possible trackers
+        might_be_tracker = False
+
+        # Check manufacturer data for Apple ID or Find My patterns
+        if 76 in advertisement_data.manufacturer_data:
+            data = advertisement_data.manufacturer_data[76]
+            # Look for Find My protocol signature
+            if len(data) > 1:
+                if (
+                    (data[0] == 0x12 and data[1] == 0x19)
+                    or data[0] == 0x10
+                    or data[0] == 0x0F
+                ):
+                    might_be_tracker = True
+
+        # Check for Find My UUIDs
+        for uuid in advertisement_data.service_uuids:
+            uuid_upper = uuid.upper()
+            if any(find_my_id in uuid_upper for find_my_id in FIND_MY_UUIDS):
+                might_be_tracker = True
+                break
+
+        # Check for service data with Find My signatures
+        for service_uuid, _ in advertisement_data.service_data.items():
+            service_uuid_upper = service_uuid.upper()
+            if any(find_my_id in service_uuid_upper for find_my_id in FIND_MY_UUIDS):
+                might_be_tracker = True
+                break
+
+        # Check if name contains tracker keywords
+        if device.name and any(
+            identifier in device.name.lower() for identifier in AIRTAG_IDENTIFIERS
+        ):
+            might_be_tracker = True
+
+        # Always keep tracking devices, even with weak signals
+        if advertisement_data.rssi < DETECTION_THRESHOLD and not might_be_tracker:
             # Only keep extremely weak signals if the device was previously seen
             # or if it has Find My identifiers worth tracking
             if not is_new_device:
@@ -2383,25 +2654,20 @@ class TagFinder:
         # Apply signal amplification for weak but usable signals to improve detection
         enhanced_rssi = advertisement_data.rssi
 
-        # Apply gentle signal boosting for weak but potentially distant important devices
-        if advertisement_data.rssi < -85 and advertisement_data.rssi > -95:
-            # Check if this might be a Find My device based on any identifiers
-            is_potential_find_my = False
-
-            # Check uuids for Find My identifiers
-            for uuid in advertisement_data.service_uuids:
-                if any(find_my_id in uuid.upper() for find_my_id in FIND_MY_UUIDS):
-                    is_potential_find_my = True
-                    break
-
-            # Check manufacturer data for Apple ID
-            if 76 in advertisement_data.manufacturer_data:
-                is_potential_find_my = True
-
-            # Apply signal boost for potential Find My devices to improve detection
-            if is_potential_find_my:
-                # Apply a small artificial signal boost to help distant Find My devices be detected
-                enhanced_rssi = advertisement_data.rssi + 5  # 5dBm boost
+        # Use the might_be_tracker flag to boost signals from potential tracking devices
+        if might_be_tracker:
+            # Apply an adaptive signal boost based on signal strength to improve detection
+            if advertisement_data.rssi < -85 and advertisement_data.rssi > -95:
+                # Moderate boost for moderately weak signals that might be trackers
+                enhanced_rssi = advertisement_data.rssi + 6  # 6dBm boost
+            elif advertisement_data.rssi <= -95:
+                # Stronger boost for very weak signals that might be trackers
+                enhanced_rssi = (
+                    advertisement_data.rssi + 8
+                )  # 8dBm boost to detect from further away
+            else:
+                # Slight boost even for stronger signals to prioritize tracker detection
+                enhanced_rssi = advertisement_data.rssi + 3  # 3dBm boost
 
         if is_new_device:
             # Create new device instance
