@@ -1,0 +1,38 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Project specific files
+*.json
+!requirements.json
+
+# Local configuration files
+.env
+.python-version
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+
+# Allow JSON files that are part of the project
+# settings.json
+# friendly_names.json
+# devices_history.json 
