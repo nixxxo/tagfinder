@@ -1,5 +1,4 @@
 import asyncio
-import argparse
 import platform
 import subprocess
 import json
@@ -10,6 +9,7 @@ import datetime
 from typing import Dict, Any, Optional, List
 import select
 import shutil  # For getting terminal size
+import re
 
 # Conditionally import platform-specific dependencies
 if platform.system() != "Windows":
@@ -34,6 +34,7 @@ from rich.text import Text
 from rich.panel import Panel
 from rich.layout import Layout
 from rich import box
+from rich.live import Live  # Added for Live display
 
 # Constants for AirTag filtering
 APPLE_COMPANY_ID = 0x004C
@@ -63,15 +64,16 @@ first_seen_timestamps: Dict[str, float] = {}  # When each device was first seen
 
 current_settings = {
     "duration": 10,
-    "airtags_only": False,
+    "airtags_only": False,  # Default to False to discover all devices
     "tx_power": DEFAULT_TX_POWER_AT_1M,
     "path_loss": DEFAULT_PATH_LOSS_EXPONENT,
-    "scan_once": True,  # Add option to run scan once vs continuous
-    "show_manufacturer_data": False,  # Option to show raw manufacturer data
-    "show_extra_columns": True,  # Show additional information columns
+    "scan_once": False,  # Default to continuous scan
+    "show_manufacturer_data": True,  # Default to show manufacturer data
     "highlight_new_devices": True,  # Highlight devices seen for the first time
     "auto_save_devices": True,  # Automatically save discovered devices
     "selected_adapter": None,  # Selected Bluetooth adapter for scanning
+    "target_airtag_serial": "HGFL6DDSP0GV",  # User's target AirTag serial
+    "target_device_address": None,  # MAC address of the specifically targeted device by user
 }
 
 # Dictionary to store friendly names for devices
@@ -536,13 +538,15 @@ def display_bluetooth_adapters():
 
     # Create a table to display adapter information
     table = Table(title=f"Bluetooth Adapters ({platform.system()})", box=box.ROUNDED)
+    table.add_column("#", style="cyan", no_wrap=True, width=3)
     table.add_column("Name", style="cyan", no_wrap=True)
     table.add_column("MAC Address", style="magenta")
     table.add_column("Manufacturer", style="green")
     table.add_column("Version/ID", style="yellow")
     table.add_column("Powered", style="blue")
 
-    for adapter in adapters:
+    # Add each adapter to the table with an index
+    for idx, adapter in enumerate(adapters):
         name = adapter.get("name", "N/A")
         address = adapter.get("address", "N/A")
         manufacturer = adapter.get("manufacturer", "N/A")
@@ -556,7 +560,24 @@ def display_bluetooth_adapters():
         elif "Off" in power_state or "No" in power_state or "Down" in power_state:
             power_text.stylize("bold red")
 
-        table.add_row(name, address, manufacturer, version, power_text)
+        # Mark currently selected adapter
+        is_selected = (
+            "[bright_green]✓[/bright_green] "
+            if current_settings["selected_adapter"] == name
+            else ""
+        )
+        display_index = f"{idx + 1}"
+        table.add_row(
+            display_index,
+            f"{is_selected}{name}",
+            address,
+            manufacturer,
+            version,
+            power_text,
+        )
+
+    # Add an option for system default
+    table.add_row("0", "[dim]Default (System Choice)[/dim]", "", "", "", "")
 
     if table.row_count > 0:
         console.print(table)
@@ -573,11 +594,47 @@ def display_bluetooth_adapters():
             "\n[dim]Note: On Linux, you may need to run with sudo to see all adapter details.[/dim]"
         )
 
-    console.print("\n[dim]Press any key to return to the main menu...[/dim]")
-    # Wait for a keypress
-    while not is_key_pressed():
-        time.sleep(0.1)
-    get_key()  # Consume the key
+    # Ask if user wants to select an adapter
+    console.print("\nDo you want to select a Bluetooth adapter to use? (y/n): ", end="")
+    choice = input().strip().lower()
+
+    if choice == "y":
+        console.print(
+            "\nEnter the number of the adapter to use (0 for default): ", end=""
+        )
+        adapter_choice = input().strip()
+
+        try:
+            idx = int(adapter_choice)
+            if idx == 0:
+                # Use system default
+                current_settings["selected_adapter"] = None
+                console.print("[green]✓ Using system default adapter.[/green]")
+            elif 1 <= idx <= len(adapters):
+                # Use selected adapter
+                selected = adapters[idx - 1]
+                adapter_name = selected.get("name", "N/A")
+                current_settings["selected_adapter"] = adapter_name
+                console.print(f"[green]✓ Selected adapter: {adapter_name}[/green]")
+            else:
+                console.print("[red]Invalid adapter number.[/red]")
+
+        except ValueError:
+            console.print("[red]Please enter a valid number.[/red]")
+
+        # Save settings
+        save_settings()
+
+        # Wait for acknowledgment
+        console.print("\n[dim]Press any key to continue...[/dim]")
+        while not is_key_pressed():
+            time.sleep(0.1)
+        get_key()
+    else:
+        console.print("\n[dim]Press any key to return to the main menu...[/dim]")
+        while not is_key_pressed():
+            time.sleep(0.1)
+        get_key()  # Consume the key
 
 
 def calculate_distance(
@@ -585,6 +642,7 @@ def calculate_distance(
     tx_power: int = DEFAULT_TX_POWER_AT_1M,
     n: float = DEFAULT_PATH_LOSS_EXPONENT,
     device_type: str = None,
+    advertised_tx_power: Optional[int] = None,
 ) -> float:
     """
     Estimates distance to a BLE device based on RSSI and TX power.
@@ -597,11 +655,20 @@ def calculate_distance(
     if rssi == 0:
         return -1.0  # Cannot determine distance
 
-    # Use device-specific TX power if available and not overridden
-    if device_type and tx_power == DEFAULT_TX_POWER_AT_1M:
-        tx_power = TX_POWER_BY_DEVICE_TYPE.get(
+    # Prioritize advertised TX power if available and valid
+    if (
+        advertised_tx_power is not None
+        and advertised_tx_power != 0
+        and advertised_tx_power != 127
+    ):  # 127 can be a placeholder for N/A
+        effective_tx_power = advertised_tx_power
+    # Else, use device-specific TX power if available and not overridden by CLI args
+    elif device_type and tx_power == DEFAULT_TX_POWER_AT_1M:
+        effective_tx_power = TX_POWER_BY_DEVICE_TYPE.get(
             device_type, TX_POWER_BY_DEVICE_TYPE["Default"]
         )
+    else:
+        effective_tx_power = tx_power
 
     # Apply environmental correction
     # Indoor environments often need higher path loss values
@@ -612,13 +679,13 @@ def calculate_distance(
     # Very strong signals are more reliable for distance calculation
     if rssi > -60:
         # For very close devices, reduce variance
-        ratio = (tx_power - rssi) / (10 * n)
+        ratio = (effective_tx_power - rssi) / (10 * n)
         # Apply some bounds checking to avoid unrealistic values
         ratio = max(0.04, min(ratio, 4.0))  # Keep within reasonable bounds
         distance = 10**ratio
     else:
         # Standard calculation for normal-to-weak signals
-        ratio = (tx_power - rssi) / (10 * n)
+        ratio = (effective_tx_power - rssi) / (10 * n)
         # Apply some bounds checking to avoid unrealistic values
         ratio = max(0.04, min(ratio, 4.0))  # Keep within reasonable bounds
         distance = 10**ratio
@@ -628,22 +695,20 @@ def calculate_distance(
 
 def extract_device_info(device_name, manufacturer_data, address, service_uuids):
     """Extract meaningful device information from BLE data."""
-    # Start with a default name
-    inferred_name = device_name
+    # Start with device name if available
+    inferred_name = device_name if device_name and device_name != "N/A" else None
     device_type = None
     company_name = None
 
-    # If we have a valid device name, use it
-    if device_name and device_name != "N/A":
-        # Clean up the name
-        inferred_name = device_name
+    # If we have a valid device name, use it and look for device type clues
+    if inferred_name:
         # Look for known device types in the name
         for keyword, device in DEVICE_SIGNATURES.items():
-            if keyword.lower() in device_name.lower():
+            if keyword.lower() in inferred_name.lower():
                 device_type = device
                 break
 
-    # Check manufacturer data for company info
+    # Check manufacturer data for company info and device type
     if manufacturer_data:
         for company_id, data in manufacturer_data.items():
             if company_id in COMPANY_IDENTIFIERS:
@@ -669,25 +734,29 @@ def extract_device_info(device_name, manufacturer_data, address, service_uuids):
                             device_type = "Find My Device"
 
     # Check for known service UUIDs that might indicate device type
-    if service_uuids:
+    if (
+        service_uuids and not device_type
+    ):  # Only check if we don't have a device type yet
         for uuid in service_uuids:
             uuid_lower = uuid.lower()
             # Audio devices often advertise A2DP, AVRCP, etc.
             if "110a" in uuid_lower or "110b" in uuid_lower:  # A2DP related
-                device_type = device_type or "Audio Device"
+                device_type = "Audio Device"
+                break
             # Heart rate, health services
             elif "180d" in uuid_lower:  # Heart rate service
                 device_type = "Health Device"
+                break
             # Battery service
             elif "180f" in uuid_lower:
-                if not device_type:
-                    device_type = "Battery-powered Device"
+                device_type = "Battery-powered Device"
+                break
             # Philips Hue and similar
             elif "1802" in uuid_lower or "1801" in uuid_lower:
-                if "light" not in str(device_type).lower():
-                    device_type = device_type or "Smart Device"
+                device_type = "Smart Device"
+                break
 
-    # Look for common patterns in addresses
+    # Look for common patterns in addresses if we still don't have company info
     if not company_name:
         # Some devices have manufacturer prefixes in MAC
         if address.startswith("C0:1A:DA"):  # Common Samsung prefix
@@ -697,26 +766,26 @@ def extract_device_info(device_name, manufacturer_data, address, service_uuids):
         elif address.startswith("84:10:95") or address.startswith("B0:C5:CA"):
             company_name = "Philips"
 
-    # Build a meaningful name
-    if company_name and device_type:
-        # If we have both company and device type
+    # Build a meaningful name - prefer actual device name first
+    if inferred_name:
+        # We already have a proper device name, use it as the meaningful name
+        meaningful_name = inferred_name
+    elif company_name and device_type:
+        # If no name but we have both company and device type
         meaningful_name = f"{company_name} {device_type}"
     elif company_name:
-        # If we only have company name
+        # If only company name
         meaningful_name = f"{company_name} Device"
     elif device_type:
-        # If we only have device type
+        # If only device type
         meaningful_name = device_type
-    elif inferred_name != "N/A":
-        # If we have an original name
-        meaningful_name = inferred_name
     else:
         # Default to Unknown with address prefix
         prefix = address.split(":")[0] if ":" in address else address[:6]
         meaningful_name = f"Device {prefix}..."
 
     return {
-        "name": inferred_name,
+        "name": device_name if device_name and device_name != "N/A" else "N/A",
         "device_type": device_type,
         "company": company_name,
         "meaningful_name": meaningful_name,
@@ -741,6 +810,8 @@ def device_callback(
 
     is_airtag_or_findmy = False
     manufacturer_data_dict = advertisement_data.manufacturer_data
+    advertised_tx = advertisement_data.tx_power  # Get advertised TX power
+    service_data_dict = advertisement_data.service_data  # Get service data
 
     # Prepare manufacturer data for processing
     mfg_data_str = ""
@@ -775,26 +846,45 @@ def device_callback(
             # Only update if we have a non-zero RSSI (sometimes 0 means no update)
             if advertisement_data.rssi != 0:
                 # Track signal trend (increasing or decreasing)
-                old_rssi = dev["rssi"]
-                new_rssi = advertisement_data.rssi
+                old_rssi = dev["rssi"]  # This would be the previous average RSSI
+                current_raw_rssi = advertisement_data.rssi
 
-                # Calculate signal trend
-                if new_rssi > old_rssi + 2:  # Signal improved by more than 2dBm
+                # Update RSSI history
+                dev["rssi_history"].append(current_raw_rssi)
+                if len(dev["rssi_history"]) > 5:  # Keep last 5 readings
+                    dev["rssi_history"].pop(0)
+
+                # Calculate average RSSI
+                avg_rssi = sum(dev["rssi_history"]) / len(dev["rssi_history"])
+                dev["rssi"] = avg_rssi  # Store the new average RSSI
+
+                # Calculate signal trend based on average RSSI changes
+                if avg_rssi > old_rssi + 1.5:  # Adjusted threshold for averaged RSSI
                     trend = "increasing"
-                elif new_rssi < old_rssi - 2:  # Signal weakened by more than 2dBm
+                elif avg_rssi < old_rssi - 1.5:  # Adjusted threshold for averaged RSSI
                     trend = "decreasing"
                 else:  # Signal roughly the same
                     trend = dev.get("signal_trend", "stable")
 
-                found_devices[idx]["rssi"] = new_rssi
+                found_devices[idx]["rssi"] = avg_rssi  # Update with average RSSI
                 found_devices[idx]["signal_trend"] = trend
                 found_devices[idx]["distance"] = calculate_distance(
-                    advertisement_data.rssi,
+                    avg_rssi,  # Use average RSSI
                     tx_power=tx_power,
                     n=path_loss,
                     device_type=device_type,
+                    advertised_tx_power=dev.get(
+                        "advertised_tx_power"
+                    ),  # Use stored advertised TX power
                 )
                 found_devices[idx]["last_seen"] = time.time()
+
+                # Update device name if it wasn't available before but is now
+                if (dev["name"] == "N/A" or not dev["name"]) and device.name:
+                    found_devices[idx]["name"] = device.name
+                    # Also update the meaningful name with the actual device name if available now
+                    if device.name and device.name != "N/A":
+                        found_devices[idx]["meaningful_name"] = device.name
 
                 # Update device history
                 update_device_history(found_devices[idx])
@@ -802,11 +892,13 @@ def device_callback(
 
     if not exists:
         # Add as new device
+        initial_rssi = advertisement_data.rssi
         distance = calculate_distance(
-            advertisement_data.rssi,
+            initial_rssi,  # Use initial RSSI for first calculation
             tx_power=tx_power,
             n=path_loss,
             device_type=device_type,
+            advertised_tx_power=advertised_tx,  # Pass advertised TX power
         )
 
         # Prepare service UUIDs string
@@ -816,10 +908,15 @@ def device_callback(
             else ""
         )
 
-        # Get friendly name if it exists
-        friendly_name = friendly_names.get(
-            device_id, device_info_extract["meaningful_name"]
-        )
+        # Determine which name to use as friendly name (prioritize actual device name)
+        if device.name and device.name != "N/A":
+            # If device has a real name, use it instead of the generated meaningful name
+            friendly_name = device.name
+        else:
+            # Otherwise use the existing friendly name or the inferred meaningful name
+            friendly_name = friendly_names.get(
+                device_id, device_info_extract["meaningful_name"]
+            )
 
         # Create the device info
         device_info = {
@@ -829,12 +926,19 @@ def device_callback(
             "company": device_info_extract["company"],
             "friendly_name": friendly_name,
             "address": device_id,
-            "rssi": advertisement_data.rssi,
+            "rssi": initial_rssi,  # Store initial RSSI, will be averaged later if device is seen again
+            "rssi_history": [initial_rssi],  # Initialize RSSI history
             "signal_trend": "stable",  # Initial signal trend
             "distance": distance,
             "is_airtag": is_airtag_or_findmy,
+            "advertised_tx_power": advertised_tx,  # Store advertised TX power
             "manufacturer_data": mfg_data_str.strip(),
             "service_uuids": service_uuids_str,
+            "service_data": {
+                str(uuid): data.hex()
+                for uuid, data in service_data_dict.items()
+                if data is not None
+            },  # Store service data
             "last_seen": time.time(),
         }
 
@@ -864,39 +968,39 @@ def clear_screen():
 
 async def scan_once():
     """Perform a single scan for Bluetooth devices."""
-    global scan_running, found_devices
+    global scan_running, found_devices, should_exit
 
     # Clear the console and show a scanning message
-    clear_screen()
+    # clear_screen() # Moved to _run_scan before Live display starts
 
-    # Get terminal dimensions for better layout
-    terminal_width, terminal_height = shutil.get_terminal_size()
+    # Get terminal dimensions for better layout - Not strictly needed for Live with screen=True
+    # terminal_width, terminal_height = shutil.get_terminal_size()
 
     # Get adapter name for display
     adapter_name = "Default (System Choice)"
     if current_settings["selected_adapter"]:
         adapter_name = current_settings["selected_adapter"]
 
-    # Create a nice looking scan screen
-    scan_mode = (
-        "Continuous scan" if not current_settings["scan_once"] else "Single scan"
-    )
-    status_text = f"""[bold cyan]Scanning for Bluetooth devices...[/bold cyan]
+    # Create a nice looking scan screen - This will be handled by Live display in _run_scan
+    # scan_mode = (
+    #     "Continuous scan" if not current_settings["scan_once"] else "Single scan"
+    # )
+    # status_text = f\"\"\"[bold cyan]Scanning for Bluetooth devices...[/bold cyan]
 
-{'Duration: ' + str(current_settings['duration']) + ' seconds' if current_settings["scan_once"] else 'Continuous scan mode'}
-Mode: {scan_mode}
-AirTag filter: {'ON' if current_settings['airtags_only'] else 'OFF'}
-TX Power: {current_settings['tx_power']} dBm
-Path Loss: {current_settings['path_loss']}
-Using adapter: [cyan]{adapter_name}[/cyan]
+    # {'Duration: ' + str(current_settings['duration']) + ' seconds' if current_settings["scan_once"] else 'Continuous scan mode'}
+    # Mode: {scan_mode}
+    # AirTag filter: {'ON' if current_settings['airtags_only'] else 'OFF'}
+    # TX Power: {current_settings['tx_power']} dBm
+    # Path Loss: {current_settings['path_loss']}
+    # Using adapter: [cyan]{adapter_name}[/cyan]
 
-[dim]Press 'q' to stop scanning and return to menu[/dim]
-"""
-    console.print(Panel(status_text, border_style="green", padding=(1, 2)))
+    # [dim]Press 'q' to stop scanning and return to menu[/dim]
+    # \"\"\"
+    # console.print(Panel(status_text, border_style="green", padding=(1, 2)))
 
     # Clear found devices for a new scan
     found_devices = []
-    scan_running = True
+    scan_running = True  # Set scan_running before calling _run_scan
 
     # Determine adapter settings for different platforms
     adapter_kwargs = {}
@@ -916,104 +1020,13 @@ Using adapter: [cyan]{adapter_name}[/cyan]
         **adapter_kwargs,
     )
 
-    return await _run_scan(scanner)
-
-
-async def _run_scan(scanner):
-    """Run the Bluetooth scan with the provided scanner."""
-    global scan_running
-
+    # _run_scan will now handle its own exceptions related to scanner.start/stop
+    # and the Live display loop.
+    # scan_once handles higher-level errors or results.
     try:
-        # Start the scanner
-        await scanner.start()
-
-        # Different behavior based on scan mode
-        if current_settings["scan_once"]:
-            # Single scan mode - Run for specified duration
-            for i in range(current_settings["duration"]):
-                # Update display every 2 seconds or on first and last iteration
-                if i == 0 or i == current_settings["duration"] - 1 or i % 2 == 0:
-                    clear_screen()
-                    progress = f"{i+1}/{current_settings['duration']} seconds"
-
-                    # Get adapter name for display
-                    adapter_name = "Default (System Choice)"
-                    if current_settings["selected_adapter"]:
-                        adapter_name = current_settings["selected_adapter"]
-
-                    status_text = f"""[bold cyan]Scanning for Bluetooth devices...[/bold cyan]
-
-Progress: {progress}
-Mode: Single scan
-AirTag filter: {'ON' if current_settings['airtags_only'] else 'OFF'}
-Using adapter: [cyan]{adapter_name}[/cyan]
-
-[dim]Press 'q' to cancel scan[/dim]
-"""
-                    console.print(
-                        Panel(status_text, border_style="green", padding=(1, 2))
-                    )
-                    display_devices()
-
-                # Check for key presses to allow early cancellation
-                await asyncio.sleep(1)
-                key = get_key()
-                if key == "q":
-                    console.print("[yellow]Scan cancelled.[/yellow]")
-                    break
-        else:
-            # Continuous scan mode - Run until stopped
-            scan_time = 0
-            while scan_running:
-                # Update display every 2 seconds
-                if scan_time % 2 == 0:
-                    clear_screen()
-
-                    # Get adapter name for display
-                    adapter_name = "Default (System Choice)"
-                    if current_settings["selected_adapter"]:
-                        adapter_name = current_settings["selected_adapter"]
-
-                    status_text = f"""[bold cyan]Scanning for Bluetooth devices...[/bold cyan]
-
-Running time: {scan_time} seconds
-Mode: Continuous scan
-AirTag filter: {'ON' if current_settings['airtags_only'] else 'OFF'}
-Devices found: {len(found_devices)}
-Using adapter: [cyan]{adapter_name}[/cyan]
-
-[bold green]Press 'q' to stop scanning and return to menu[/bold green]
-"""
-                    console.print(
-                        Panel(status_text, border_style="green", padding=(1, 2))
-                    )
-                    display_devices()
-
-                # Check for key presses to stop scanning
-                await asyncio.sleep(1)
-                scan_time += 1
-                key = get_key()
-                if key == "q":
-                    console.print("[yellow]Scan stopped.[/yellow]")
-                    break
-
-        # Stop the scanner
-        await scanner.stop()
-
-        # Show final results only for single scan mode
-        if current_settings["scan_once"]:
-            clear_screen()
-            console.print("\n[bold green]✓ Scan complete![/bold green]\n")
-            display_devices()
-            console.print("\n[dim]Press any key to return to the main menu...[/dim]")
-
-            # Wait for a keypress to return to main menu
-            while not is_key_pressed():
-                await asyncio.sleep(0.1)
-            get_key()  # Consume the key
-
+        await _run_scan(scanner)
     except BleakError as be:
-        console.print(f"[red]Bluetooth error during scanning: {be}[/red]")
+        console.print(f"[red]Bluetooth error: {be}[/red]")
         console.print(
             "[yellow]This may indicate missing Bluetooth adapters or permissions issues.[/yellow]"
         )
@@ -1021,21 +1034,362 @@ Using adapter: [cyan]{adapter_name}[/cyan]
             console.print(
                 "[yellow]On Linux, you may need to run with sudo or add your user to the bluetooth group.[/yellow]"
             )
-
         console.print("\n[dim]Press any key to return to the main menu...[/dim]")
-        await asyncio.sleep(3)  # Give time to read the error
+        # await asyncio.sleep(3) # Give time to read the error - Handled by key press
         while not is_key_pressed():
             await asyncio.sleep(0.1)
         get_key()  # Consume the key
     except Exception as e:
-        console.print(f"[red]Error during scanning: {e}[/red]")
+        console.print(f"[red]Error during scan setup: {e}[/red]")
         console.print("\n[dim]Press any key to return to the main menu...[/dim]")
-        await asyncio.sleep(3)  # Give time to read the error
+        # await asyncio.sleep(3)
         while not is_key_pressed():
             await asyncio.sleep(0.1)
         get_key()  # Consume the key
+    # finally:
+    # scan_running = False # _run_scan's finally block should handle this
+
+
+async def _run_scan(scanner: BleakScanner):
+    """Run the Bluetooth scan with the provided scanner using Rich Live display."""
+    global scan_running, found_devices, should_exit, current_settings
+
+    clear_screen()  # Clear once before Live display
+
+    adapter_name = "Default (System Choice)"
+    if current_settings["selected_adapter"]:
+        adapter_name = current_settings["selected_adapter"]
+
+    def generate_current_scan_display(progress_info_str: str) -> Layout:
+        scan_mode_str = (
+            "Single scan" if current_settings["scan_once"] else "Continuous scan"
+        )
+        status_text_content = f"""[bold cyan]Scanning for Bluetooth devices...[/bold cyan]
+
+{progress_info_str}
+Mode: {scan_mode_str}
+AirTag filter: {'ON' if current_settings['airtags_only'] else 'OFF'}
+Devices found: {len(found_devices)}
+Using adapter: [cyan]{adapter_name}[/cyan]
+
+[bold green]Available commands while scanning:[/bold green]
+q - {'Cancel' if current_settings["scan_once"] else 'Stop'} scan and return to menu
+[dim]l - List adapters (use main menu)[/dim]
+[dim]b - Change adapter (use main menu)[/dim]
+"""
+        status_panel = Panel(status_text_content, border_style="green", padding=(1, 2))
+
+        devices_renderable = display_devices()  # Returns Table or Panel
+
+        display_layout = Layout(name="root")
+        display_layout.split_column(
+            Layout(status_panel, name="status", minimum_size=10, ratio=1),
+            Layout(devices_renderable, name="devices_list", ratio=3),
+        )
+        return display_layout
+
+    try:
+        await scanner.start()
+
+        with Live(
+            generate_current_scan_display("Initializing..."),
+            refresh_per_second=4,  # Adjust for desired refresh rate
+            screen=True,
+            transient=False,  # Keeps display until Live block exits
+        ) as live:
+
+            scan_start_time = time.time()
+
+            while scan_running:  # Primary loop condition
+                current_time = time.time()
+                elapsed_scan_time = current_time - scan_start_time
+                progress_str = ""
+
+                if current_settings["scan_once"]:
+                    duration = current_settings["duration"]
+                    if elapsed_scan_time >= duration:
+                        scan_running = False  # Signal scan to stop
+                        break
+                    progress_str = (
+                        f"Progress: {int(elapsed_scan_time) + 1}/{duration} seconds"
+                    )
+                else:  # Continuous scan
+                    progress_str = f"Running time: {int(elapsed_scan_time)} seconds"
+
+                live.update(generate_current_scan_display(progress_str))
+
+                key = get_key()
+                if key:
+                    if key == "q":
+                        scan_running = False  # Signal to stop
+                        message = (
+                            "[yellow]Scan cancelled.[/yellow]"
+                            if current_settings["scan_once"]
+                            else "[yellow]Scan stopped.[/yellow]"
+                        )
+                        # live.console.print(message, justify="center") # Print to live console
+                        # await asyncio.sleep(0.5) # Let message show briefly
+                        # No direct print needed here, scan_once handles post-scan messages
+                        break
+                    elif key in ("l", "b"):
+                        # live.console.print("[yellow]To list/change adapters, please stop scan (q) and use main menu.[/yellow]", justify="center")
+                        # await asyncio.sleep(1.5) # Show message
+                        # The message is now part of the status panel
+                        pass
+
+                if not scan_running:  # Re-check if q was pressed or duration ended
+                    break
+
+                await asyncio.sleep(
+                    0.1
+                )  # Short sleep to yield control, check keys, allow BLE callbacks
+
+    except BleakError as be:
+        # This error is specific to scanner operations like start/stop
+        console.print(f"[red]Bluetooth error during scanning operation: {be}[/red]")
+        console.print(
+            "[yellow]This may indicate missing Bluetooth adapters or permissions issues.[/yellow]"
+        )
+        if platform.system() == "Linux":
+            console.print(
+                "[yellow]On Linux, you may need to run with sudo or add your user to the bluetooth group.[/yellow]"
+            )
+        # console.print("\n[dim]Press any key to return to the main menu...[/dim]")
+        # await asyncio.sleep(3)
+        # while not is_key_pressed(): # Let scan_once handle this interaction
+        #     await asyncio.sleep(0.1)
+        # get_key()
+        scan_running = False  # Ensure scan stops
+        raise  # Re-raise for scan_once to handle user interaction for returning to menu
+
+    except Exception as e:
+        # General errors during _run_scan (e.g., within Live loop if not caught there)
+        console.print(f"[red]Error during scan execution: {e}[/red]")
+        # console.print("\n[dim]Press any key to return to the main menu...[/dim]")
+        # await asyncio.sleep(3)
+        # while not is_key_pressed():
+        #     await asyncio.sleep(0.1)
+        # get_key()
+        scan_running = False  # Ensure scan stops
+        raise  # Re-raise for scan_once
+
     finally:
-        scan_running = False
+        if (
+            scanner.is_scanning
+        ):  # is_scanning might not be available on all backends, or check via other means
+            try:
+                await scanner.stop()
+            except BleakError as be_stop:
+                console.print(
+                    f"[yellow]Warning: Error stopping scanner: {be_stop}[/yellow]"
+                )
+            except Exception as e_stop:  # Catch any other error during stop
+                console.print(
+                    f"[yellow]Warning: Generic error stopping scanner: {e_stop}[/yellow]"
+                )
+        scan_running = False  # Ensure this is always set
+
+    # Post-scan messages for 'scan_once' are handled by the caller (scan_once function)
+    # after _run_scan completes or raises an exception.
+    # If _run_scan completes normally (scan_running becomes False due to duration or 'q'),
+    # control returns to scan_once.
+
+
+# Original _run_scan parts that are now integrated or handled by Live or scan_once:
+# - Initial status panel printing (done by Live)
+# - Loop with display_devices() and clear_screen() (done by Live update)
+# - Key handling for l and b (simplified for now)
+# - Final "Scan complete" and device display for scan_once (handled in scan_once after _run_scan)
+# - BleakError and Exception handling (now more structured)
+
+
+async def display_adapters_during_scan():
+    """Display Bluetooth adapters. For use when scan is NOT live or Live is paused."""
+    # Keep scan running but pause display updates temporarily
+    clear_screen()
+    console.print("\n[bold cyan]Available Bluetooth Adapters[/bold cyan]\n")
+
+    adapters = get_bluetooth_adapters()
+
+    if not adapters:
+        console.print("[yellow]No Bluetooth adapters found.[/yellow]")
+        console.print("\n[dim]Press any key to return to scanning...[/dim]")
+        await asyncio.sleep(0.5)
+        while not is_key_pressed():
+            await asyncio.sleep(0.1)
+        get_key()
+        return
+
+    # Create a table to display adapter information
+    table = Table(title=f"Bluetooth Adapters ({platform.system()})", box=box.ROUNDED)
+    table.add_column("#", style="cyan", no_wrap=True, width=3)
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("MAC Address", style="magenta")
+    table.add_column("Manufacturer", style="green")
+    table.add_column("Powered", style="blue")
+
+    for idx, adapter in enumerate(adapters):
+        name = adapter.get("name", "N/A")
+        address = adapter.get("address", "N/A")
+        manufacturer = adapter.get("manufacturer", "N/A")
+        power_state = adapter.get("powered", "N/A")
+
+        # Format power state with color
+        power_text = Text(power_state)
+        if "On" in power_state or "OK" in power_state or "Yes" in power_state:
+            power_text.stylize("bold green")
+        elif "Off" in power_state or "No" in power_state or "Down" in power_state:
+            power_text.stylize("bold red")
+
+        # Mark current adapter
+        is_selected = (
+            "[bright_green]✓[/bright_green] "
+            if current_settings["selected_adapter"] == name
+            else ""
+        )
+        display_index = f"{idx + 1}"
+        table.add_row(
+            display_index, f"{is_selected}{name}", address, manufacturer, power_text
+        )
+
+    console.print(table)
+    console.print("\n[dim]Press any key to return to scanning...[/dim]")
+
+    # Wait for key press
+    await asyncio.sleep(0.5)
+    while not is_key_pressed():
+        await asyncio.sleep(0.1)
+    get_key()
+
+
+async def change_adapter_during_scan(current_scanner):
+    """Allow changing the Bluetooth adapter during an active scan."""
+    global current_settings
+
+    # Pause the current scanner
+    await current_scanner.stop()
+
+    clear_screen()
+    console.print("\n[bold cyan]Change Bluetooth Adapter[/bold cyan]\n")
+
+    adapters = get_bluetooth_adapters()
+
+    if not adapters:
+        console.print("[yellow]No Bluetooth adapters found.[/yellow]")
+        console.print("\n[dim]Press any key to return to scanning...[/dim]")
+        await asyncio.sleep(0.5)
+        while not is_key_pressed():
+            await asyncio.sleep(0.1)
+        get_key()
+
+        # Restart the scanner with the same adapter
+        await current_scanner.start()
+        return
+
+    # Create a table to display adapter information
+    table = Table(title=f"Bluetooth Adapters ({platform.system()})", box=box.ROUNDED)
+    table.add_column("#", style="cyan", no_wrap=True, width=3)
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("MAC Address", style="magenta")
+    table.add_column("Status", style="blue")
+
+    for idx, adapter in enumerate(adapters):
+        name = adapter.get("name", "N/A")
+        address = adapter.get("address", "N/A")
+        power_state = adapter.get("powered", "N/A")
+
+        # Format power state with color
+        status = (
+            "Active" if current_settings["selected_adapter"] == name else power_state
+        )
+        status_text = Text(status)
+        if status == "Active":
+            status_text.stylize("bold green")
+        elif "On" in power_state or "OK" in power_state:
+            status_text.stylize("green")
+        else:
+            status_text.stylize("red")
+
+        table.add_row(f"{idx + 1}", name, address, status_text)
+
+    # Add default option
+    default_status = (
+        "Active" if current_settings["selected_adapter"] is None else "Available"
+    )
+    default_text = Text(default_status)
+    default_text.stylize("bold green" if default_status == "Active" else "green")
+    table.add_row("0", "Default (System Choice)", "", default_text)
+
+    console.print(table)
+    console.print(
+        "\nEnter adapter number to use (0 for default), or press Enter to cancel: ",
+        end="",
+    )
+
+    # Get adapter selection
+    choice = input().strip()
+
+    restart_with_new_adapter = False
+
+    if choice:
+        try:
+            idx = int(choice)
+            if idx == 0:
+                if current_settings["selected_adapter"] is not None:
+                    current_settings["selected_adapter"] = None
+                    console.print("[green]✓ Switching to default adapter[/green]")
+                    restart_with_new_adapter = True
+                else:
+                    console.print("[yellow]Already using default adapter[/yellow]")
+            elif 1 <= idx <= len(adapters):
+                selected = adapters[idx - 1]
+                adapter_name = selected.get("name", "N/A")
+
+                if current_settings["selected_adapter"] != adapter_name:
+                    current_settings["selected_adapter"] = adapter_name
+                    console.print(
+                        f"[green]✓ Switching to adapter: {adapter_name}[/green]"
+                    )
+                    restart_with_new_adapter = True
+                else:
+                    console.print(
+                        f"[yellow]Already using adapter: {adapter_name}[/yellow]"
+                    )
+            else:
+                console.print("[red]Invalid adapter number[/red]")
+
+        except ValueError:
+            console.print("[red]Invalid input[/red]")
+
+    # Allow time to see the message
+    await asyncio.sleep(1)
+
+    if restart_with_new_adapter:
+        # Save the settings
+        save_settings()
+
+        # We need to create a new scanner with the selected adapter
+        adapter_kwargs = {}
+        if platform.system() == "Linux" and current_settings["selected_adapter"]:
+            adapter_kwargs = {"adapter": current_settings["selected_adapter"]}
+
+        # Create new scanner with updated adapter
+        new_scanner = BleakScanner(
+            detection_callback=lambda d, ad: device_callback(
+                d,
+                ad,
+                current_settings["airtags_only"],
+                current_settings["tx_power"],
+                current_settings["path_loss"],
+            ),
+            **adapter_kwargs,
+        )
+
+        # Replace the reference to the scanner
+        current_scanner.__dict__.update(new_scanner.__dict__)
+
+    # Restart the scanner (whether changed or not)
+    await current_scanner.start()
 
 
 def display_help():
@@ -1132,6 +1486,9 @@ Path loss exponent varies by environment:
   select which one to use for scanning.
 • Linux users can specify adapters like "hci0", "hci1", etc.
 • The default option uses the system's primary adapter.
+• During continuous scanning, you can press 'l' to list adapters
+  or 'b' to switch between available adapters without stopping
+  the scan.
 """
 
     content_layout["help"].update(
@@ -1153,56 +1510,42 @@ Path loss exponent varies by environment:
 
 
 def display_devices():
-    """Display the list of found devices in a nicely formatted table."""
+    """Display the list of found devices in a nicely formatted table.
+    Returns a Rich Table object or a Rich Panel if no devices are found.
+    """
     if not found_devices:
-        console.print("[yellow]No devices found.[/yellow]")
-        return
+        # console.print("[yellow]No devices found.[/yellow]")
+        return Panel(
+            "[yellow]Scanning... No devices found yet.[/yellow]",
+            border_style="dim",
+            padding=(1, 2),
+            title="Devices",
+        )
 
     # Sort devices by RSSI (strongest signal first)
     sorted_devices = sorted(found_devices, key=lambda x: x["rssi"], reverse=True)
 
     try:
-        # Table configuration based on user settings
-        if current_settings["show_extra_columns"]:
-            # Extended table with more information
-            table = Table(
-                title=f"Bluetooth Devices ({len(sorted_devices)})",
-                box=box.SIMPLE,
-                show_header=True,
-                header_style="bold cyan",
-                row_styles=["", "dim"],  # Alternating row styles
-                border_style="bright_black",
-                min_width=95,  # Wider for more columns
-            )
+        # Create a comprehensive table with all information columns
+        table = Table(
+            title=f"Bluetooth Devices ({len(sorted_devices)})",
+            box=box.SIMPLE,
+            show_header=True,
+            header_style="bold cyan",
+            row_styles=["", "dim"],  # Alternating row styles
+            border_style="bright_black",
+            min_width=95,  # Wider for more columns
+        )
 
-            # Add extended columns
-            table.add_column("Name/Alias", style="cyan", no_wrap=True, width=20)
-            table.add_column("RSSI", justify="right", width=5)
-            table.add_column("Sig", width=4, justify="center")
-            table.add_column("Dist", style="blue", width=6, justify="right")
-            table.add_column("Type", style="green", width=12)
-            table.add_column("Company", style="yellow", width=10)
-            table.add_column("First Seen", style="magenta", width=12)
-            table.add_column("ID", style="dim", width=18, overflow="fold")
-        else:
-            # Standard table with essential information
-            table = Table(
-                title=f"Bluetooth Devices ({len(sorted_devices)})",
-                box=box.SIMPLE,
-                show_header=True,
-                header_style="bold cyan",
-                row_styles=["", "dim"],  # Alternating row styles
-                border_style="bright_black",
-                min_width=70,
-            )
-
-            # Add standard columns
-            table.add_column("Name/Alias", style="cyan", no_wrap=True, width=20)
-            table.add_column("RSSI", justify="right", width=5)
-            table.add_column("Sig", width=4, justify="center")
-            table.add_column("Dist", style="blue", width=6, justify="right")
-            table.add_column("Type", style="green", width=12)
-            table.add_column("ID", style="magenta", width=18, overflow="fold")
+        # Add all available columns
+        table.add_column("Name/Alias", style="cyan", no_wrap=True, width=20)
+        table.add_column("RSSI", justify="right", width=5)
+        table.add_column("Sig", width=4, justify="center")
+        table.add_column("Dist", style="blue", width=6, justify="right")
+        table.add_column("Type", style="green", width=12)
+        table.add_column("Company", style="yellow", width=10)
+        table.add_column("First Seen", style="magenta", width=12)
+        table.add_column("ID", style="dim", width=18, overflow="fold")
 
         # Add device data
         for i, device in enumerate(sorted_devices):
@@ -1210,12 +1553,21 @@ def display_devices():
             if "address" not in device or "rssi" not in device:
                 continue  # Skip incomplete device entries
 
-            # Show friendly name if set, otherwise use enhanced name
-            display_name = device.get(
-                "friendly_name",
-                device.get("meaningful_name", device.get("name", "Unknown")),
-            )
-            if display_name is None:
+            # Prioritize actual device name if available
+            actual_name = device.get("name", "N/A")
+            if (
+                actual_name != "N/A"
+                and actual_name is not None
+                and actual_name.strip() != ""
+            ):
+                display_name = actual_name
+            else:
+                # Fall back to other options if no actual device name
+                display_name = device.get(
+                    "friendly_name", device.get("meaningful_name", "Unknown")
+                )
+
+            if display_name is None or display_name == "N/A":
                 display_name = "Unknown"
 
             addr = device.get("address", "")
@@ -1321,48 +1673,64 @@ def display_devices():
                 except Exception:
                     pass  # Ignore errors with manufacturer data
 
-            # Add row to table based on display mode
+            # Determine row styling based on target settings
+            row_style = ""
+            is_target_by_address = (
+                current_settings.get("target_device_address")
+                and device.get("address") == current_settings["target_device_address"]
+            )
+            is_potential_target_airtag = device.get(
+                "is_airtag", False
+            ) and current_settings.get("target_airtag_serial")
+
+            if is_target_by_address:
+                row_style = (
+                    "on bright_cyan"  # Most prominent highlight for specific target
+                )
+                display_name = f"🎯 TARGET 🎯\n{display_name}"
+            elif is_potential_target_airtag:
+                row_style = "on dark_magenta"  # Highlight for all AirTags if a serial is being looked for
+                display_name = f"⚠️ AirTag ⚠️\n{display_name}"
+
+            # Add row to table
             try:
-                if current_settings["show_extra_columns"]:
-                    # Extended table
-                    table.add_row(
-                        display_name,
-                        rssi_text,
-                        trend_text,
-                        distance_str,
-                        type_text,
-                        company,
-                        first_seen_str,
-                        addr,
-                    )
-                else:
-                    # Standard table
-                    table.add_row(
-                        display_name,
-                        rssi_text,
-                        trend_text,
-                        distance_str,
-                        type_text,
-                        addr,
-                    )
+                table.add_row(
+                    display_name,
+                    rssi_text,
+                    trend_text,
+                    distance_str,
+                    type_text,
+                    company,
+                    first_seen_str,
+                    addr,
+                    style=row_style,  # Apply the determined style to the row
+                )
             except Exception as row_err:
                 # If adding a specific row fails, log it but continue with other rows
-                print(f"Error adding device row: {row_err}")
+                print(
+                    f"Error adding device row: {row_err}"
+                )  # This print will go to original stdout
                 continue
 
         # Print the table with error handling
-        console.print(table)
+        # console.print(table) # Removed: will return table object
+        return table
     except Exception as e:
         # Fallback to a simple display if the rich table fails
-        console.print(f"[red]Error displaying device table: {e}[/red]")
-        console.print(f"[yellow]Found {len(sorted_devices)} devices[/yellow]")
+        # console.print(f"[red]Error displaying device table: {e}[/red]")
+        # console.print(f"[yellow]Found {len(sorted_devices)} devices[/yellow]")
         # Print a simpler version of the data
-        for i, device in enumerate(sorted_devices[:10]):  # Limit to first 10 devices
-            name = device.get("friendly_name", device.get("name", "Unknown"))
-            rssi = device.get("rssi", 0)
-            console.print(f"{i+1}. {name} (RSSI: {rssi})")
-        if len(sorted_devices) > 10:
-            console.print(f"... and {len(sorted_devices) - 10} more devices")
+        # for i, device in enumerate(sorted_devices[:10]):  # Limit to first 10 devices
+        #     name = device.get("name", device.get("friendly_name", "Unknown"))
+        #     rssi = device.get("rssi", 0)
+        #     console.print(f"{i+1}. {name} (RSSI: {rssi})")
+        # if len(sorted_devices) > 10:
+        #     console.print(f"... and {len(sorted_devices) - 10} more devices")
+        return Panel(
+            f"[red]Error displaying device table: {e}[/red]\n[yellow]Found {len(sorted_devices)} devices[/yellow]",
+            border_style="red",
+            title="Device Display Error",
+        )
 
 
 def display_menu():
@@ -1400,6 +1768,9 @@ def display_menu():
     if current_settings["selected_adapter"]:
         adapter_display = current_settings["selected_adapter"]
 
+    target_serial_display = current_settings.get("target_airtag_serial", "None")
+    target_address_display = current_settings.get("target_device_address", "None")
+
     # Add a row for each command with settings on the right
     menu_grid.add_row(
         "s",
@@ -1428,20 +1799,20 @@ def display_menu():
     menu_grid.add_row(
         "p",
         "Set Path Loss",
-        "Show Extra Info:",
-        "ON" if current_settings["show_extra_columns"] else "OFF",
-    )
-    menu_grid.add_row(
-        "m",
-        "Toggle Scan Mode",
         "Highlight New:",
         "ON" if current_settings["highlight_new_devices"] else "OFF",
     )
     menu_grid.add_row(
-        "l",
-        "List Adapters",
+        "m",
+        "Toggle Scan Mode",
         "Auto Save:",
         "ON" if current_settings["auto_save_devices"] else "OFF",
+    )
+    menu_grid.add_row(
+        "l",
+        "List Adapters",
+        "Show Mfg Data:",
+        "ON" if current_settings["show_manufacturer_data"] else "OFF",
     )
     menu_grid.add_row(
         "b",
@@ -1449,13 +1820,34 @@ def display_menu():
         "BT Adapter:",
         adapter_display,
     )
+    menu_grid.add_row(  # New option for setting target MAC
+        "k", "Set Target MAC", "Target Serial:", f"{target_serial_display}"
+    )
     menu_grid.add_row(
         "c",
         "Clear Devices",
+        "Target MAC:",
+        f"{target_address_display}",
+    )
+    # Add new toggles with letter keys
+    menu_grid.add_row(
+        "u",  # Was '1'
+        "Toggle Auto Save",
+        "Auto Save:",
+        "ON" if current_settings["auto_save_devices"] else "OFF",
+    )
+    menu_grid.add_row(
+        "i",  # Was '2'
+        "Toggle Highlight New",
+        "Highlight New:",
+        "ON" if current_settings["highlight_new_devices"] else "OFF",
+    )
+    menu_grid.add_row(
+        "o",  # Was '3'
+        "Toggle Show Mfg Data",
         "Show Mfg Data:",
         "ON" if current_settings["show_manufacturer_data"] else "OFF",
     )
-    menu_grid.add_row("x", "Toggle Extra Columns", "", "")
     menu_grid.add_row("h", "Help", "", "")
     menu_grid.add_row("q", "Quit", "", "")
 
@@ -1728,6 +2120,51 @@ def update_device_history(device: Dict[str, Any]):
         save_device_history()
 
 
+def set_target_device_address():
+    """Allow the user to set or clear the target device MAC address."""
+    global current_settings
+    clear_screen()
+    console.print("[bold cyan]Set Target Device MAC Address[/bold cyan]")
+
+    current_target_address = current_settings.get("target_device_address", "Not set")
+    console.print(
+        f"\nCurrent target MAC address: [yellow]{current_target_address}[/yellow]"
+    )
+    console.print(
+        "Enter the MAC address of the device you want to specifically target."
+    )
+    console.print("Leave blank and press Enter to clear the current target address.")
+    console.print("\nEnter MAC address: ", end="")
+
+    mac_address = input().strip()
+
+    if not mac_address:  # User wants to clear
+        current_settings["target_device_address"] = None
+        console.print("[green]✓ Target device MAC address cleared.[/green]")
+    else:
+        # Basic validation for MAC address format (e.g., XX:XX:XX:XX:XX:XX or XXXXXXXXXXXX)
+        # This is a simple check, can be made more robust if needed
+        if re.match(
+            r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$", mac_address
+        ) or re.match(
+            r"^[0-9A-Fa-f]{12}$", mac_address.replace(":", "").replace("-", "")
+        ):
+            current_settings["target_device_address"] = mac_address.upper()
+            console.print(
+                f"[green]✓ Target device MAC address set to: {current_settings['target_device_address']}[/green]"
+            )
+        else:
+            console.print(
+                "[red]Invalid MAC address format. Please use XX:XX:XX:XX:XX:XX or similar.[/red]"
+            )
+
+    save_settings()
+    console.print("\n[dim]Press any key to return to the main menu...[/dim]")
+    while not is_key_pressed():
+        time.sleep(0.1)
+    get_key()
+
+
 def toggle_setting(setting_name: str):
     """Toggle a boolean setting and save settings."""
     if setting_name in current_settings and isinstance(
@@ -1785,8 +2222,14 @@ async def main_interactive():
                     display_help()
 
                 elif key == "s":  # Start scan
+                    # await scan_once() # scan_once now sets scan_running
+                    # clear_screen() is handled by scan_once/_run_scan
+
+                    # Need to ensure scan_running is True before calling scan_once
+                    # scan_running = True # scan_once sets this.
                     await scan_once()
-                    clear_screen()  # Ensure clean return to menu
+                    # After scan_once returns, display_menu will be called again, clearing the screen.
+                    # This is fine. No explicit clear_screen() needed here.
 
                 elif key == "a":  # Toggle AirTags only
                     current_settings["airtags_only"] = not current_settings[
@@ -1821,26 +2264,26 @@ async def main_interactive():
                     current_settings["scan_once"] = not current_settings["scan_once"]
                     save_settings()
 
-                elif key == "x":  # Toggle extra columns
-                    toggle_setting("show_extra_columns")
-
                 elif key == "l":  # List adapters
                     display_bluetooth_adapters()
 
                 elif key == "b":  # Select Bluetooth adapter
                     select_bluetooth_adapter()
 
+                elif key == "k":  # Set target device MAC address (new key)
+                    set_target_device_address()
+
                 elif key == "c":  # Clear devices
                     found_devices.clear()
 
                 # Add new key handlers for the new settings
-                elif key == "1":  # Toggle auto save
+                elif key == "u":  # Toggle auto save (was '1')
                     toggle_setting("auto_save_devices")
 
-                elif key == "2":  # Toggle highlight new
+                elif key == "i":  # Toggle highlight new (was '2')
                     toggle_setting("highlight_new_devices")
 
-                elif key == "3":  # Toggle show manufacturer data
+                elif key == "o":  # Toggle show manufacturer data (was '3')
                     toggle_setting("show_manufacturer_data")
 
                 # Save settings after any change
@@ -1982,9 +2425,10 @@ def select_bluetooth_adapter():
         elif "Off" in power_state or "No" in power_state or "Down" in power_state:
             power_text.stylize("bold red")
 
+        # Mark currently selected adapter
         is_selected = (
             "[bright_green]✓[/bright_green] "
-            if current_settings["selected_adapter"] == adapter.get("name", "N/A")
+            if current_settings["selected_adapter"] == name
             else ""
         )
         display_index = f"{idx + 1}"
@@ -1997,152 +2441,86 @@ def select_bluetooth_adapter():
             power_text,
         )
 
-    # Add an option to use the system default adapter
-    table.add_row("0", "[dim]Default Adapter (System Choice)[/dim]", "", "", "", "")
+    # Add an option for system default
+    table.add_row("0", "[dim]Default (System Choice)[/dim]", "", "", "", "")
 
-    console.print(table)
+    if table.row_count > 0:
+        console.print(table)
+    else:
+        console.print("[yellow]No adapter information could be displayed.[/yellow]")
 
-    # Get adapter selection from user
-    console.print(
-        "\nEnter the number of the adapter to use (0 for default), or press Enter to cancel: ",
-        end="",
-    )
-    choice = input().strip()
+    # Add platform-specific notes
+    if platform.system() == "Windows":
+        console.print(
+            "\n[dim]Note: On Windows, some adapter details may be limited without admin privileges.[/dim]"
+        )
+    elif platform.system() == "Linux":
+        console.print(
+            "\n[dim]Note: On Linux, you may need to run with sudo to see all adapter details.[/dim]"
+        )
 
-    if not choice:
-        return
+    # Ask if user wants to select an adapter
+    console.print("\nDo you want to select a Bluetooth adapter to use? (y/n): ", end="")
+    choice = input().strip().lower()
 
-    try:
-        idx = int(choice)
-        if idx == 0:
-            # Use system default (None)
-            current_settings["selected_adapter"] = None
-            console.print("[green]✓ Using system default adapter.[/green]")
-        elif 1 <= idx <= len(adapters):
-            # Use selected adapter
-            selected = adapters[idx - 1]
-            adapter_name = selected.get("name", "N/A")
-            current_settings["selected_adapter"] = adapter_name
-            console.print(f"[green]✓ Selected adapter: {adapter_name}[/green]")
-        else:
-            console.print("[red]Invalid adapter number.[/red]")
+    if choice == "y":
+        console.print(
+            "\nEnter the number of the adapter to use (0 for default): ", end=""
+        )
+        adapter_choice = input().strip()
 
-    except ValueError:
-        console.print("[red]Please enter a valid number.[/red]")
+        try:
+            idx = int(adapter_choice)
+            if idx == 0:
+                # Use system default
+                current_settings["selected_adapter"] = None
+                console.print("[green]✓ Using system default adapter.[/green]")
+            elif 1 <= idx <= len(adapters):
+                # Use selected adapter
+                selected = adapters[idx - 1]
+                adapter_name = selected.get("name", "N/A")
+                current_settings["selected_adapter"] = adapter_name
+                console.print(f"[green]✓ Selected adapter: {adapter_name}[/green]")
+            else:
+                console.print("[red]Invalid adapter number.[/red]")
 
-    # Save the settings
-    save_settings()
+        except ValueError:
+            console.print("[red]Please enter a valid number.[/red]")
 
-    console.print("\n[dim]Press any key to return to the main menu...[/dim]")
-    while not is_key_pressed():
-        time.sleep(0.1)
-    get_key()  # Consume the key
+        # Save settings
+        save_settings()
+
+        # Wait for acknowledgment
+        console.print("\n[dim]Press any key to continue...[/dim]")
+        while not is_key_pressed():
+            time.sleep(0.1)
+        get_key()
+    else:
+        console.print("\n[dim]Press any key to return to the main menu...[/dim]")
+        while not is_key_pressed():
+            time.sleep(0.1)
+        get_key()  # Consume the key
 
 
 if __name__ == "__main__":
     try:
         # Initialize the application
         initialize_app()
+        setup_terminal()  # Make sure terminal is set up for interactive mode
 
-        # Process command-line arguments if provided
-        if len(sys.argv) > 1:
-            # For backward compatibility, support original CLI arguments
-            console.print(
-                "[yellow]Legacy CLI mode detected. Consider running without arguments for interactive mode.[/yellow]"
-            )
-
-            parser = argparse.ArgumentParser(
-                description="Python CLI for Bluetooth device scanning.",
-                formatter_class=argparse.RawTextHelpFormatter,
-            )
-            parser.add_argument(
-                "--list-adapters",
-                action="store_true",
-                help="List available Bluetooth adapters on your system.",
-            )
-            parser.add_argument(
-                "--scan",
-                action="store_true",
-                help="Scan for Bluetooth Low Energy (BLE) devices.",
-            )
-            parser.add_argument(
-                "--duration",
-                type=int,
-                default=10,
-                help="Duration of the scan in seconds (default: 10).",
-            )
-            parser.add_argument(
-                "--airtags-only",
-                action="store_true",
-                help="Filter scan results to show only AirTags and other Apple Find My devices.",
-            )
-            parser.add_argument(
-                "--tx-power",
-                type=int,
-                default=DEFAULT_TX_POWER_AT_1M,
-                help=f"TX power at 1 meter for distance calculation (default: {DEFAULT_TX_POWER_AT_1M} dBm).",
-            )
-            parser.add_argument(
-                "--path-loss",
-                type=float,
-                default=DEFAULT_PATH_LOSS_EXPONENT,
-                help=f"Path loss exponent for distance calculation (default: {DEFAULT_PATH_LOSS_EXPONENT}).",
-            )
-            parser.add_argument(
-                "--adapter",
-                type=str,
-                help="Specify which Bluetooth adapter to use (e.g., 'hci0' on Linux).",
-            )
-
-            args = parser.parse_args()
-
-            # Update settings from command line
-            current_settings["airtags_only"] = args.airtags_only
-            current_settings["tx_power"] = args.tx_power
-            current_settings["path_loss"] = args.path_loss
-            current_settings["duration"] = args.duration
-            if args.adapter:
-                current_settings["selected_adapter"] = args.adapter
-
-            # Run in CLI mode
-            if args.list_adapters:
-                # Use the new cross-platform adapter detection
-                adapters = get_bluetooth_adapters()
-                if adapters:
-                    console.print("[bold cyan]Bluetooth Adapters:[/bold cyan]")
-                    for i, adapter in enumerate(adapters):
-                        console.print(f"[green]Adapter {i+1}:[/green]")
-                        for key, value in adapter.items():
-                            console.print(f"  {key}: {value}")
-                        console.print("")
-                else:
-                    console.print(
-                        "[yellow]No Bluetooth adapters detected or insufficient permissions.[/yellow]"
-                    )
-
-            if args.scan:
-                scan_running = True
-                asyncio.run(scan_once())
-
-            if not args.list_adapters and not args.scan:
-                console.print(
-                    "[yellow]No action specified. Use --help for options or run without arguments for interactive mode.[/yellow]"
-                )
-
-        else:
-            # Run in interactive mode
-            try:
-                asyncio.run(main_interactive())
-            finally:
-                # Restore terminal settings
-                restore_terminal()
+        # Run in interactive mode
+        asyncio.run(main_interactive())
 
     except KeyboardInterrupt:
         console.print("\n[bold yellow]Application interrupted by user.[/bold yellow]")
-        # Ensure terminal settings are restored
-        restore_terminal()
 
     except Exception as e:
         console.print(f"[bold red]Unhandled error in script execution: {e}[/bold red]")
-        # Ensure terminal settings are restored
+        import traceback
+
+        console.print(f"[dim]{traceback.format_exc()}[/dim]")
+
+    finally:
+        # Restore terminal settings
         restore_terminal()
+        console.print("[bold cyan]Exiting TagFinder. Goodbye![/bold cyan]")
