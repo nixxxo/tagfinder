@@ -22,6 +22,10 @@ from rich.layout import Layout
 from rich.box import ROUNDED, HEAVY, SIMPLE
 from rich import box
 
+# Import OrPattern for passive scanning on Linux
+from bleak.backends.bluezdbus.advertisement_monitor import OrPattern
+from bleak.assigned_numbers import AdvertisementDataType
+
 
 # Helper functions
 def format_time_ago(seconds: float) -> str:
@@ -2618,6 +2622,15 @@ class TagFinder:
             "timeout", SCAN_PARAMETERS["timeout"]
         )
 
+        # Create basic or_patterns for passive scanning - required for Linux
+        # This is a basic pattern that will match any BLE advertisement
+        or_patterns = [
+            OrPattern(0, AdvertisementDataType.FLAGS, b"\x00"),  # Match any flags
+            OrPattern(
+                0, AdvertisementDataType.COMPLETE_LOCAL_NAME, b"\x00"
+            ),  # Match any name
+        ]
+
         # Display scanning parameters
         self.console.print(
             Panel(
@@ -2643,6 +2656,11 @@ class TagFinder:
                 "window": scan_settings.get("window", SCAN_PARAMETERS["window"]),
                 "passive": not scan_settings.get("active", SCAN_PARAMETERS["active"]),
             }
+
+            # Add required or_patterns for passive scanning
+            if scanner_kwargs["scanning_mode"] == "passive":
+                scanner_kwargs["bluez"]["or_patterns"] = or_patterns
+
         elif hasattr(bleak.backends, "corebluetooth") and sys.platform == "darwin":
             # For macOS systems - can set some CoreBluetooth parameters
             # CoreBluetooth doesn't expose as many parameters as BlueZ
@@ -2705,6 +2723,8 @@ class TagFinder:
                                 # Handle passive scanning mode for Linux
                                 if "passive" in phase and phase["mode"] == "passive":
                                     scanner_kwargs["bluez"]["passive"] = True
+                                    # Add required or_patterns for passive scanning
+                                    scanner_kwargs["bluez"]["or_patterns"] = or_patterns
                                 else:
                                     scanner_kwargs["bluez"]["passive"] = False
 
@@ -3375,6 +3395,14 @@ class TagFinder:
         # Set maximum range mode for testing
         old_range_mode = self.settings.get("range_mode", "Normal")
 
+        # Create basic or_patterns for passive scanning - required for Linux
+        or_patterns = [
+            OrPattern(0, AdvertisementDataType.FLAGS, b"\x00"),  # Match any flags
+            OrPattern(
+                0, AdvertisementDataType.COMPLETE_LOCAL_NAME, b"\x00"
+            ),  # Match any name
+        ]
+
         # Force maximum range settings for the test
         SCAN_DURATION = 20.0  # Extended duration for thorough testing
         DETECTION_THRESHOLD = -100  # Maximum sensitivity
@@ -3504,6 +3532,8 @@ class TagFinder:
                         if "passive" in phase and phase["mode"] == "passive":
                             # Ensure bluez parameter is set correctly for passive scanning
                             scanner_kwargs["bluez"]["passive"] = True
+                            # Add required or_patterns for passive scanning
+                            scanner_kwargs["bluez"]["or_patterns"] = or_patterns
                         else:
                             # Active scanning
                             scanner_kwargs["bluez"]["passive"] = False
