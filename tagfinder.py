@@ -22,6 +22,20 @@ from rich.layout import Layout
 from rich.box import ROUNDED, HEAVY, SIMPLE
 from rich import box
 
+
+# Helper functions
+def format_time_ago(seconds: float) -> str:
+    """Format a time duration in seconds into a human-readable string"""
+    if seconds < 60:
+        return f"{seconds:.1f} seconds"
+    elif seconds < 3600:
+        minutes = seconds / 60
+        return f"{minutes:.1f} minutes"
+    else:
+        hours = seconds / 3600
+        return f"{hours:.1f} hours"
+
+
 # Constants
 SETTINGS_FILE = "settings.json"
 HISTORY_FILE = "devices_history.json"
@@ -30,12 +44,41 @@ AIRTAG_IDENTIFIERS = [
     "airtag",
     "find my",
     "locate",
-]  # Identifiers to detect AirTags
-FIND_MY_UUIDS = ["7DFC9000", "7DFC9001", "FD44", "05AC"]  # Apple Find My related UUIDs
+    "tracker",
+    "tag",
+    "tile",
+    "chipolo",
+    "samsung tag",
+    "smarttag",
+]  # Identifiers to detect AirTags and other trackers
+FIND_MY_UUIDS = [
+    "7DFC9000",
+    "7DFC9001",
+    "FD44",
+    "05AC",
+    "74278BDA",
+    "0000FD44",
+    "FD5A",
+    "0000180A",
+    "0000180F",
+    "7DFC9002",
+    "7DFC9003",
+    "74278BDA-B644-4520-8F0C-720EAF059935",
+]  # Apple and other tracker related UUIDs
 SCAN_INTERVAL = 1.0  # Scan interval in seconds
 DEFAULT_RSSI_AT_ONE_METER = -59  # Default RSSI at 1 meter for Bluetooth LE
 DEFAULT_DISTANCE_N_VALUE = 2.0  # Default environmental factor for distance calculation
-RSSI_HISTORY_SIZE = 10  # Number of RSSI readings to keep for smoothing
+RSSI_HISTORY_SIZE = 20  # Increased number of RSSI readings to keep for better smoothing
+SCAN_MODE = "active"  # Can be "active" or "passive"
+SCAN_DURATION = 10.0  # Duration of each scan in seconds
+DETECTION_THRESHOLD = -85  # RSSI threshold for considering a device in range
+SCAN_PARAMETERS = {
+    "timeout": 5.0,
+    "windown": 0x0100,  # Window parameter for scanning
+    "interval": 0x0060,  # Interval parameter for scanning (smaller value = more aggressive)
+    "filters": None,  # No filters for maximum detection
+    "active": True,  # Active scanning for more data
+}
 
 # Company identifiers (Bluetooth SIG assigned numbers)
 COMPANY_IDENTIFIERS = {
@@ -54,6 +97,15 @@ COMPANY_IDENTIFIERS = {
     0x0157: "Anhui Huami",
     0x038F: "Xiaomi",
     0x02D0: "Tile",
+    0x0157: "Fitbit",
+    0x012D: "Sony Ericsson",
+    0x008A: "Tencent",
+    0x00E0: "Vivo",
+    0x01D7: "Qualcomm",
+    0x0BDA: "Samsung Electronics",
+    0x0131: "Cypress Semiconductor",
+    0x0131: "Chipolo",
+    0x0A12: "Cambridge Silicon Radio",
 }
 
 # Device types based on services or characteristics
@@ -80,6 +132,14 @@ DEVICE_TYPES = {
     "1828": "Mesh Proxy",
     "183A": "Environmental Sensing",
     "181A": "Environmental Sensing",
+    "FDCD": "Tile Tag",
+    "FD5A": "Samsung SmartTag",
+    "74278BDA": "Apple Find My",
+    "0000180A": "Device Information",
+    "0000180F": "Battery Service",
+    "00001802": "Immediate Alert (Tracking)",
+    "0000FD44": "Apple Nearby",
+    "0000FD5A": "Samsung Find",
 }
 
 # Apple specific service flags for device type identification
@@ -94,6 +154,41 @@ APPLE_DEVICE_TYPES = {
     0x08: "HomePod",
     0x09: "AirPods",
     0x0A: "AirTag",
+    0x0B: "Apple Pencil",
+    0x0C: "Apple Vision Pro",
+    0x0F: "Apple Network Adapter",
+}
+
+# Tracking device types
+TRACKING_DEVICE_TYPES = {
+    "AIRTAG": {
+        "company_id": 0x004C,
+        "identifiers": ["airtag", "apple tag", "find my tag"],
+        "uuids": ["7DFC9000", "7DFC9001", "0000FD44"],
+        "data_patterns": [
+            {"offset": 0, "value": 0x12, "mask": 0xFF},
+            {"offset": 1, "value": 0x19, "mask": 0xFF},
+            {"offset": 2, "value": 0x0A, "mask": 0x0F},
+        ],
+    },
+    "SAMSUNG_SMARTTAG": {
+        "company_id": 0x0075,
+        "identifiers": ["samsung tag", "smarttag", "smart tag", "galaxy tag"],
+        "uuids": ["FD5A", "0000FD5A"],
+        "data_patterns": [],
+    },
+    "TILE": {
+        "company_id": 0x02D0,
+        "identifiers": ["tile", "tile tracker"],
+        "uuids": ["FDCD", "FEED"],
+        "data_patterns": [],
+    },
+    "CHIPOLO": {
+        "company_id": 0x0131,
+        "identifiers": ["chipolo"],
+        "uuids": ["FEE1", "FEE0"],
+        "data_patterns": [],
+    },
 }
 
 
@@ -350,23 +445,48 @@ class Device:
         return ""
 
     def _check_if_airtag(self) -> bool:
-        """Check if device is potentially an AirTag or Find My device"""
-        # Check name
+        """Check if device is potentially an AirTag or other tracking device"""
+        # First check if name contains any tracker identifiers
         if self.name and any(
             identifier in self.name.lower() for identifier in AIRTAG_IDENTIFIERS
         ):
             return True
 
-        # Check manufacturer data for Apple identifiers
-        if (
-            76 in self.manufacturer_data
-        ):  # Apple's company identifier is 0x004C (76 decimal)
-            # Check for AirTag specific patterns in the data
+        # Check for specific tracking devices based on detailed patterns
+        for tracker_type, tracker_info in TRACKING_DEVICE_TYPES.items():
+            # Check manufacturer ID
+            if tracker_info["company_id"] in self.manufacturer_data:
+                data = self.manufacturer_data[tracker_info["company_id"]]
+
+                # Check data patterns if available
+                if tracker_info["data_patterns"]:
+                    pattern_matches = True
+                    for pattern in tracker_info["data_patterns"]:
+                        offset = pattern["offset"]
+                        if (
+                            len(data) <= offset
+                            or (data[offset] & pattern["mask"]) != pattern["value"]
+                        ):
+                            pattern_matches = False
+                            break
+                    if pattern_matches:
+                        return True
+
+                # If no specific pattern defined but company ID matches, check UUIDs
+                for uuid in self.service_uuids:
+                    if any(
+                        tracker_uuid in uuid.upper()
+                        for tracker_uuid in tracker_info["uuids"]
+                    ):
+                        return True
+
+        # Check for Apple-specific identifiers (Find My network)
+        if 76 in self.manufacturer_data:  # Apple's company identifier (0x004C)
             data = self.manufacturer_data[76]
 
-            # AirTag specific pattern checking
+            # Find My network signals
             if len(data) > 2:
-                # Find My network typically has these patterns
+                # Various Find My patterns
                 if (data[0] == 0x12 and data[1] == 0x19) or (data[0] == 0x10):
                     return True
 
@@ -374,30 +494,148 @@ class Device:
                 if len(data) > 3 and data[2] & 0x0F == 0x0A:  # AirTag type is 0x0A
                     return True
 
+                # Check for other Apple tracking-related patterns
+                if data[0] in [0x02, 0x05, 0x07, 0x0F] and len(data) >= 5:
+                    # These values are often associated with tracking in Apple devices
+                    return True
+
         # Check service UUIDs for Find My related services
         for uuid in self.service_uuids:
+            uuid_upper = uuid.upper()
             for find_my_id in FIND_MY_UUIDS:
-                if find_my_id in uuid.upper():
+                if find_my_id in uuid_upper:
                     return True
+
+        # Look for specific service data patterns
+        for service_uuid, service_data in self.service_data.items():
+            # Check for specific service data patterns related to tracking
+            if service_uuid.upper() in ["FD5A", "FDCD", "7DFC9000", "FD44", "0000FD44"]:
+                return True
 
         return False
 
+    def get_tracker_type(self) -> str:
+        """Identify the specific type of tracking device"""
+        if not self.is_airtag:
+            return "Not a tracker"
+
+        # Check for AirTag
+        if self.manufacturer == "Apple":
+            if "airtag" in self.name.lower() or (
+                76 in self.manufacturer_data
+                and len(self.manufacturer_data[76]) > 2
+                and self.manufacturer_data[76][2] & 0x0F == 0x0A
+            ):
+                return "Apple AirTag"
+            return "Apple Find My Device"
+
+        # Samsung SmartTag
+        if self.manufacturer == "Samsung" or any(
+            tag in self.name.lower()
+            for tag in ["smarttag", "samsung tag", "galaxy tag"]
+        ):
+            return "Samsung SmartTag"
+
+        # Tile trackers
+        if self.manufacturer == "Tile" or "tile" in self.name.lower():
+            return "Tile Tracker"
+
+        # Chipolo trackers
+        if "chipolo" in self.name.lower():
+            return "Chipolo Tracker"
+
+        # Generic tracker if we can't identify the specific type
+        return "Unknown Tracker"
+
     @property
     def smooth_rssi(self) -> float:
-        """Get smoothed RSSI value by averaging recent readings"""
+        """Get smoothed RSSI value using Kalman-inspired filtering for better stability"""
         if not self.rssi_history:
             return self.rssi
-        return sum(self.rssi_history) / len(self.rssi_history)
+
+        # Use more sophisticated smoothing algorithm for better stability
+        # This is a simplified Kalman-inspired approach for RSSI
+
+        # First remove outliers (more than 15 dBm from median)
+        if len(self.rssi_history) >= 5:
+            median_rssi = sorted(self.rssi_history)[len(self.rssi_history) // 2]
+            filtered_values = [
+                r for r in self.rssi_history if abs(r - median_rssi) <= 15
+            ]
+            if filtered_values:  # Ensure we still have values after filtering
+                rssi_values = filtered_values
+            else:
+                rssi_values = list(self.rssi_history)
+        else:
+            rssi_values = list(self.rssi_history)
+
+        # Calculate weighted average (more recent values have higher weight)
+        if len(rssi_values) <= 2:
+            # Simple average for small number of readings
+            return sum(rssi_values) / len(rssi_values)
+
+        # Weighted average based on recency
+        total_weight = 0
+        weighted_sum = 0
+        for i, rssi in enumerate(rssi_values):
+            # Exponential weighting - more recent values get higher weight
+            weight = math.exp(0.5 * i / len(rssi_values))
+            weighted_sum += rssi * weight
+            total_weight += weight
+
+        return weighted_sum / total_weight if total_weight else self.rssi
 
     @property
     def distance(self) -> float:
-        """Calculate approximate distance based on smoothed RSSI"""
+        """Calculate approximate distance with improved environment correction"""
         if self.smooth_rssi == 0:
             return float("inf")
-        return 10 ** (
-            (self.calibrated_rssi_at_one_meter - self.smooth_rssi)
-            / (10 * self.calibrated_n_value)
-        )
+
+        # Get environment-specific parameters (different for indoors vs outdoors)
+        env_factor = self.calibrated_n_value
+
+        # Apply signal strength correction based on device type and environment
+        # Different device types and environments affect signal differently
+        rssi_correction = 0
+
+        # Adjust for known device types
+        if self.device_type.lower() in ["airtag", "apple airtag"]:
+            # AirTags tend to have stronger signals
+            rssi_correction = -2  # Subtract 2 dBm (signal appears stronger than it is)
+        elif "tag" in self.device_type.lower() or "tracker" in self.device_type.lower():
+            # Other trackers may need different adjustments
+            rssi_correction = -1
+
+        # Adjust environment factor based on signal stability
+        stability = self.signal_stability
+        if stability > 8:
+            # Very unstable signal, likely multipath interference (indoors)
+            env_factor = max(env_factor, 3.0)  # Increase path loss exponent
+        elif stability < 3:
+            # Very stable signal, likely line-of-sight (outdoors)
+            env_factor = min(env_factor, 2.2)  # Decrease path loss exponent
+
+        # Apply corrections to RSSI
+        corrected_rssi = self.smooth_rssi + rssi_correction
+
+        # Enhanced log-distance path loss model with adjustment for close proximity
+        if corrected_rssi > self.calibrated_rssi_at_one_meter - 5:
+            # Device is very close (< 1m), use linear interpolation for higher accuracy
+            # This addresses the limitation of the log model at close range
+            signal_ratio = (self.calibrated_rssi_at_one_meter - corrected_rssi) / 5.0
+            return max(0.1, signal_ratio)  # Range: 0.1 to 1.0 meters
+        else:
+            # Standard log-distance path loss model for normal ranges
+            distance = 10 ** (
+                (self.calibrated_rssi_at_one_meter - corrected_rssi) / (10 * env_factor)
+            )
+
+            # Add slight correction for very far distances to account for noise floor
+            if distance > 10:
+                # Exponential limitation to prevent unrealistic distances due to noise
+                distance = 10 + 5 * (1 - math.exp(-(distance - 10) / 20))
+
+            return max(0.1, distance)  # Ensure positive distance
 
     def calibrate_distance(self, known_distance: float):
         """Calibrate distance calculation for this device at a known distance"""
@@ -407,6 +645,20 @@ class Device:
                 (self.calibrated_rssi_at_one_meter - self.smooth_rssi)
                 / (10 * math.log10(known_distance))
             )
+
+            # Validate and limit to reasonable ranges (1.0 to 4.0)
+            self.calibrated_n_value = max(1.0, min(4.0, self.calibrated_n_value))
+
+            # Also update the RSSI at one meter based on the measurement
+            # This is especially useful for the first calibration point
+            if known_distance == 1.0:
+                self.calibrated_rssi_at_one_meter = self.smooth_rssi
+            elif known_distance < 1.0:
+                # If we have a closer measurement, extrapolate to 1m
+                self.calibrated_rssi_at_one_meter = self.smooth_rssi - (
+                    10 * self.calibrated_n_value * math.log10(known_distance)
+                )
+
             return True
         return False
 
@@ -417,14 +669,62 @@ class Device:
 
     @property
     def signal_stability(self) -> float:
-        """Calculate signal stability as standard deviation of RSSI history"""
-        if len(self.rssi_history) < 2:
+        """Calculate signal stability as improved noise metric"""
+        if len(self.rssi_history) < 3:
             return 0.0
+
+        # Calculate standard deviation of RSSI values
         mean = sum(self.rssi_history) / len(self.rssi_history)
         variance = sum((x - mean) ** 2 for x in self.rssi_history) / len(
             self.rssi_history
         )
-        return math.sqrt(variance)
+        std_dev = math.sqrt(variance)
+
+        # Calculate rate of change (first derivative)
+        rssi_list = list(self.rssi_history)
+        deltas = [
+            abs(rssi_list[i] - rssi_list[i - 1]) for i in range(1, len(rssi_list))
+        ]
+        avg_delta = sum(deltas) / len(deltas) if deltas else 0
+
+        # Combined stability metric (weighted sum of std dev and rate of change)
+        # Lower values indicate more stable signal
+        stability_metric = (0.7 * std_dev) + (0.3 * avg_delta)
+
+        return stability_metric
+
+    @property
+    def signal_quality(self) -> float:
+        """Assess signal quality on a scale of 0-100%"""
+        # Start with base quality from RSSI
+        if self.smooth_rssi >= -50:
+            base_quality = 100  # Excellent signal
+        elif self.smooth_rssi >= -65:
+            base_quality = 80  # Very good signal
+        elif self.smooth_rssi >= -75:
+            base_quality = 60  # Good signal
+        elif self.smooth_rssi >= -85:
+            base_quality = 40  # Fair signal
+        else:
+            base_quality = 20  # Poor signal
+
+        # Reduce quality based on signal stability
+        stability = self.signal_stability
+        stability_factor = max(
+            0, 1 - (stability / 10)
+        )  # 0 if very unstable, 1 if stable
+
+        # Reduce quality based on duration (better assessment over time)
+        # More time means more confident assessment
+        duration = self.seen_duration
+        duration_factor = min(
+            1.0, duration / 30
+        )  # Up to 30 seconds to reach max confidence
+
+        # Calculate final quality score
+        quality = base_quality * stability_factor * duration_factor
+
+        return min(100, max(0, quality))
 
     @property
     def seen_duration(self) -> float:
@@ -492,6 +792,10 @@ class TagFinder:
         self.input_buffer = ""  # Buffer for multi-digit input
         self.last_key_time = time.time()  # Last time a key was pressed
 
+        # Selection cursor properties
+        self.cursor_position = 0  # Current position in device list for tabbing
+        self.selection_mode = False  # Whether we're in tab-based selection mode
+
         # For persistent device IDs
         self.next_device_id = 0  # Next ID to assign to a new device
         self.device_ids = {}  # Maps device address to its assigned ID
@@ -543,7 +847,7 @@ class TagFinder:
                 return []
         return []
 
-    def _save_history(self):
+    async def _save_history(self):
         """Save device history to JSON file"""
         try:
             # Convert current devices to dict and add to history
@@ -730,12 +1034,15 @@ class TagFinder:
         # Sort devices by RSSI (closest first)
         sorted_devices = sorted(devices.values(), key=lambda d: d.rssi, reverse=True)
 
+        # Store sorted list for tab-based selection
+        self.sorted_device_list = sorted_devices
+
         # Reset device map for this display
         device_map = {}
         # Track visible devices for UI count
         visible_devices = 0
 
-        for device in sorted_devices:
+        for i, device in enumerate(sorted_devices):
             # Skip non-AirTags if in AirTag only mode
             if self.airtag_only_mode and not device.is_airtag:
                 continue
@@ -773,6 +1080,16 @@ class TagFinder:
 
             # Highlight selected device
             style = "on blue" if device.address == self.selected_device else ""
+
+            # Highlight current cursor position in tab-selection mode
+            if (
+                self.selection_mode
+                and i == self.cursor_position
+                and len(sorted_devices) > 0
+            ):
+                style = "on green"
+                # Map the cursor position to this device for easy selection with Enter
+                self.cursor_device = device.address
 
             # Display detailed information without the seen time
             details = device.device_details if device.device_details else ""
@@ -909,192 +1226,175 @@ class TagFinder:
             )
 
     def generate_device_details(self, device: Device) -> Panel:
-        """Generate detailed panel for selected device"""
-        if not device:
-            return Panel("No device selected", title="Device Details")
+        """Generate detail panel for selected device"""
+        # Create a text object to build up the details panel
+        details_text = Text()
+        details_text.append("\n")  # Start with a newline for spacing
 
-        # Extract services information
-        service_info = ""
+        # Basic Device Info section
+        details_text.append("◉ ", style="bold green")
+        details_text.append("Basic Info", style="bold yellow")
+        details_text.append("\n")
+
+        details_text.append(f"  Name: ", style="bold")
+        details_text.append(f"{device.name or 'Unknown'}\n")
+
+        details_text.append(f"  Address: ", style="bold")
+        details_text.append(f"{device.address}\n")
+
+        details_text.append(f"  Manufacturer: ", style="bold")
+        details_text.append(f"{device.manufacturer}\n")
+
+        details_text.append(f"  Device Type: ", style="bold")
+        details_text.append(f"{device.device_type}\n")
+
+        # Add tracker identification if it's a tracking device
+        if device.is_airtag:
+            tracker_type = device.get_tracker_type()
+            details_text.append(f"  Tracker Type: ", style="bold red")
+            details_text.append(f"{tracker_type}\n", style="bold red")
+
+        # Signal Information section
+        details_text.append("\n◉ ", style="bold green")
+        details_text.append("Signal Data", style="bold yellow")
+        details_text.append("\n")
+
+        details_text.append(f"  Current RSSI: ", style="bold")
+        # Color code based on signal strength
+        rssi_style = (
+            "green" if device.rssi > -70 else "yellow" if device.rssi > -85 else "red"
+        )
+        details_text.append(f"{device.rssi} dBm\n", style=rssi_style)
+
+        details_text.append(f"  Smoothed RSSI: ", style="bold")
+        smooth_rssi_style = (
+            "green"
+            if device.smooth_rssi > -70
+            else "yellow" if device.smooth_rssi > -85 else "red"
+        )
+        details_text.append(f"{device.smooth_rssi:.1f} dBm\n", style=smooth_rssi_style)
+
+        details_text.append(f"  Signal Quality: ", style="bold")
+        quality = device.signal_quality
+        quality_style = "green" if quality > 70 else "yellow" if quality > 40 else "red"
+        details_text.append(f"{quality:.1f}%\n", style=quality_style)
+
+        details_text.append(f"  Signal Stability: ", style="bold")
+        stability = device.signal_stability
+        stability_style = (
+            "green" if stability < 3 else "yellow" if stability < 6 else "red"
+        )
+        details_text.append(f"{stability:.1f}\n", style=stability_style)
+
+        # Distance Estimation section
+        details_text.append("\n◉ ", style="bold green")
+        details_text.append("Distance Estimation", style="bold yellow")
+        details_text.append("\n")
+
+        details_text.append(f"  Estimated Distance: ", style="bold")
+        distance = device.distance
+        distance_label = f"{distance:.2f} meters"
+        if distance < 1:
+            distance_label += f" ({distance * 100:.0f} cm)"
+        distance_style = (
+            "green" if distance < 2 else "yellow" if distance < 5 else "red"
+        )
+        details_text.append(f"{distance_label}\n", style=distance_style)
+
+        details_text.append(f"  Calibration Values: ", style="bold")
+        details_text.append(
+            f"N={device.calibrated_n_value:.2f}, RSSI@1m={device.calibrated_rssi_at_one_meter}\n"
+        )
+
+        # Time Information section
+        details_text.append("\n◉ ", style="bold green")
+        details_text.append("Timing Information", style="bold yellow")
+        details_text.append("\n")
+
+        details_text.append(f"  First Seen: ", style="bold")
+        first_seen_ago = time.time() - device.first_seen
+        details_text.append(
+            f"{time.strftime('%H:%M:%S', time.localtime(device.first_seen))} "
+            f"({format_time_ago(first_seen_ago)})\n"
+        )
+
+        details_text.append(f"  Last Seen: ", style="bold")
+        last_seen_ago = time.time() - device.last_seen
+        details_text.append(
+            f"{time.strftime('%H:%M:%S', time.localtime(device.last_seen))} "
+            f"({format_time_ago(last_seen_ago)})\n"
+        )
+
+        details_text.append(f"  Tracked Duration: ", style="bold")
+        details_text.append(f"{format_time_ago(device.seen_duration)}\n")
+
+        # Technical Details section
+        details_text.append("\n◉ ", style="bold green")
+        details_text.append("Technical Details", style="bold yellow")
+        details_text.append("\n")
+
+        # Service UUIDs
         if device.service_uuids:
-            service_info = "\n[bold]Services:[/]"
-            for uuid in device.service_uuids[:10]:  # Limit to 10 services
-                short_uuid = uuid[-4:].upper()
-                service_name = DEVICE_TYPES.get(short_uuid, "Unknown")
-                service_info += f"\n  {short_uuid}: {service_name}"
+            truncated = len(device.service_uuids) > 5
+            service_uuids = device.service_uuids[:5]  # Limit to first 5 UUIDs
+            details_text.append(f"  Service UUIDs: ", style="bold")
+            for i, uuid in enumerate(service_uuids):
+                if i > 0:
+                    details_text.append(", ")
+                # Highlight known tracking UUIDs in red
+                if any(known_uuid in uuid.upper() for known_uuid in FIND_MY_UUIDS):
+                    details_text.append(uuid, style="bold red")
+                else:
+                    details_text.append(uuid)
+            if truncated:
+                details_text.append(f" +{len(device.service_uuids) - 5} more")
+            details_text.append("\n")
 
-            if len(device.service_uuids) > 10:
-                service_info += f"\n  ... and {len(device.service_uuids) - 10} more"
+        # Manufacturer Data
+        if device.manufacturer_data:
+            details_text.append(f"  Manufacturer Data: ", style="bold")
+            mfg_data_entries = []
+            for company_id, data in device.manufacturer_data.items():
+                if company_id in COMPANY_IDENTIFIERS:
+                    company_name = COMPANY_IDENTIFIERS[company_id]
+                    mfg_data_str = (
+                        f"{company_name} (0x{company_id:04X}): {data.hex()[:16]}"
+                    )
+                    if len(data.hex()) > 16:
+                        mfg_data_str += "..."
+                    mfg_data_entries.append(mfg_data_str)
+                else:
+                    mfg_data_str = f"0x{company_id:04X}: {data.hex()[:16]}"
+                    if len(data.hex()) > 16:
+                        mfg_data_str += "..."
+                    mfg_data_entries.append(mfg_data_str)
 
-        # Extract manufacturer data
-        mfg_data = ""
-        for key, value in device.manufacturer_data.items():
-            company = COMPANY_IDENTIFIERS.get(key, f"Unknown ({key})")
-            mfg_data += f"\n  {company}: {value.hex()}"
+            details_text.append(", ".join(mfg_data_entries[:2]))
+            if len(mfg_data_entries) > 2:
+                details_text.append(f" +{len(mfg_data_entries) - 2} more")
+            details_text.append("\n")
 
-        # Prepare battery info if available
-        battery_info = ""
-        if 76 in device.manufacturer_data:
-            apple_data = device.manufacturer_data[76]
-            if len(apple_data) >= 13 and (
-                apple_data[0] == 0x07 or apple_data[0] == 0x01
-            ):
-                if apple_data[1] == 0x19:
-                    left_battery = apple_data[6] & 0x0F
-                    right_battery = (apple_data[6] & 0xF0) >> 4
-                    case_battery = apple_data[7] & 0x0F
-                    if left_battery < 0x0F and right_battery < 0x0F:
-                        battery_info = f"\n[bold]Battery Levels:[/]"
-                        battery_info += f"\n  Left: {left_battery*10}%"
-                        battery_info += f"\n  Right: {right_battery*10}%"
-                        battery_info += f"\n  Case: {case_battery*10}%"
+        # Additional Details
+        if device.device_details:
+            details_text.append(f"  Additional Details: ", style="bold")
+            details_text.append(f"{device.device_details}\n")
 
-        # Calculate distance trend (is it getting closer or further)
-        distance_trend = ""
-        if len(device.rssi_history) > 3:
-            first_half = list(device.rssi_history)[: len(device.rssi_history) // 2]
-            second_half = list(device.rssi_history)[len(device.rssi_history) // 2 :]
+        # Actions Section
+        details_text.append("\n◉ ", style="bold green")
+        details_text.append("Available Actions", style="bold yellow")
+        details_text.append("\n")
+        details_text.append("  [C] ", style="bold cyan")
+        details_text.append("Calibrate\n")
+        details_text.append("  [B] ", style="bold cyan")
+        details_text.append("Back to device list\n")
 
-            avg_first = sum(first_half) / len(first_half)
-            avg_second = sum(second_half) / len(second_half)
-
-            if avg_second > avg_first + 3:  # RSSI increased (getting closer)
-                distance_trend = " [green](moving closer)[/]"
-            elif avg_second < avg_first - 3:  # RSSI decreased (moving away)
-                distance_trend = " [red](moving away)[/]"
-            else:
-                distance_trend = " [yellow](stationary)[/]"
-
-        # Create a simple trend indicator for the panel
-        trend_indicator = ""
-        if distance_trend:
-            if "closer" in distance_trend:
-                trend_indicator = "[bold green]↓↓ MOVING CLOSER ↓↓[/]"
-            elif "away" in distance_trend:
-                trend_indicator = "[bold red]↑↑ MOVING AWAY ↑↑[/]"
-            else:
-                trend_indicator = "[bold yellow]== STATIONARY ==[/]"
-
-        # Create visual distance indicator
-        # The closer, the more bars we show
-        max_distance = 10.0  # Maximum tracking distance in meters
-        distance_pct = min(1.0, device.distance / max_distance)
-        inverse_pct = 1.0 - distance_pct  # Invert so closer = more bars
-        bar_count = int(10 * inverse_pct)
-        bars = "█" * bar_count + "░" * (10 - bar_count)
-
-        # Signal strength visual indicator
-        signal_bars = ""
-        if device.smooth_rssi > -60:
-            signal_bars = "[bold green]▮▮▮▮▮[/]"
-        elif device.smooth_rssi > -70:
-            signal_bars = "[bold green]▮▮▮▮[/][bold gray]▮[/]"
-        elif device.smooth_rssi > -80:
-            signal_bars = "[bold yellow]▮▮▮[/][bold gray]▮▮[/]"
-        elif device.smooth_rssi > -90:
-            signal_bars = "[bold yellow]▮▮[/][bold gray]▮▮▮[/]"
-        else:
-            signal_bars = "[bold red]▮[/][bold gray]▮▮▮▮[/]"
-
-        # Compile the panel content with more visual elements for tracking
-        if self.scanning:
-            # More visual, tracking-oriented display when scanning
-            details_content = [
-                f"[bold cyan]{device.name}[/] ({device.device_type})",
-                f"[bold]Address:[/] {device.address[-10:]}",
-                "",
-                f"[bold]Distance:[/] {device.distance:.2f}m   {trend_indicator}",
-                f"[{bars}] {100*inverse_pct:.0f}% signal",
-                "",
-                f"[bold]Signal:[/] {device.smooth_rssi:.1f} dBm  {signal_bars}",
-                f"[bold]Stability:[/] {device.signal_stability:.1f}",
-                "",
-                f"[bold]Manufacturer:[/] {device.manufacturer}",
-                f"[bold]AirTag/Find My:[/] {'Yes' if device.is_airtag else 'No'}",
-            ]
-
-            # Add conditionally displayed information based on available space
-            if self.console.width > 100:
-                details_content.extend(
-                    [
-                        f"[bold]First seen:[/] {time.strftime('%H:%M:%S', time.localtime(device.first_seen))}",
-                        f"[bold]Duration:[/] {device.seen_duration:.1f} seconds",
-                    ]
-                )
-
-            # Add battery info if available
-            if battery_info:
-                details_content.append(f"{battery_info}")
-
-            # Always add the return instructions
-            details_content.extend(
-                [
-                    "",
-                    "[bold]Press 'b' to return to all devices[/]",
-                ]
-            )
-
-            return Panel(
-                "\n".join(details_content),
-                title=f"[bold green]TRACKING: {device.name}[/]",
-                border_style="green",
-                box=ROUNDED,
-                expand=True,  # Make panel expand to fill available space
-            )
-        else:
-            # Standard details display when not scanning - make it responsive
-            details_content = [
-                f"[bold]Name:[/] {device.name}",
-                f"[bold]Address:[/] {device.address}",
-                f"[bold]Type:[/] {device.device_type}",
-                f"[bold]Manufacturer:[/] {device.manufacturer}",
-                f"[bold]RSSI:[/] {device.smooth_rssi:.1f} dBm (raw: {device.rssi} dBm)",
-                f"[bold]Distance:[/] {device.distance:.2f} meters{distance_trend}",
-                f"[bold]Signal Stability:[/] {device.signal_stability:.2f}",
-            ]
-
-            # Add conditionally displayed information based on available space
-            if self.console.width > 100:
-                details_content.extend(
-                    [
-                        f"[bold]First seen:[/] {time.strftime('%H:%M:%S', time.localtime(device.first_seen))}",
-                        f"[bold]Last seen:[/] {time.strftime('%H:%M:%S', time.localtime(device.last_seen))}",
-                        f"[bold]Duration:[/] {device.seen_duration:.1f} seconds",
-                    ]
-                )
-
-            # Always include important device classification
-            details_content.append(
-                f"[bold]AirTag/Find My:[/] {'Yes' if device.is_airtag else 'No'}"
-            )
-
-            # Include calibration details if available and space permits
-            if self.console.width > 120:
-                details_content.extend(
-                    [
-                        f"[bold]N-Value:[/] {device.calibrated_n_value:.2f}",
-                        f"[bold]RSSI@1m:[/] {device.calibrated_rssi_at_one_meter} dBm",
-                    ]
-                )
-
-            # Include manufacturer data and services for larger screens
-            if self.console.width > 140 and mfg_data:
-                details_content.append(f"[bold]Manufacturer Data:[/] {mfg_data}")
-
-            # Include service info for larger screens
-            if self.console.width > 160 and service_info:
-                details_content.append(f"{service_info}")
-
-            # Always include battery info if available
-            if battery_info:
-                details_content.append(f"{battery_info}")
-
-            return Panel(
-                "\n".join(details_content),
-                title=f"[bold cyan]Device Details: {device.name}[/]",
-                border_style="cyan",
-                box=ROUNDED,
-                expand=True,  # Make panel expand to fill available space
-            )
+        # Return the details panel
+        return Panel(
+            details_text,
+            title=f"[bold green]Device Details: {device.name or 'Unknown'}[/]",
+            border_style="green",
+            box=ROUNDED,
+        )
 
     def summarize_findings(self):
         """Summarize findings from history or current scan"""
@@ -1256,17 +1556,44 @@ class TagFinder:
             if self.current_adapter:
                 scanner_kwargs["adapter"] = self.current_adapter
 
-            # Scan for a few seconds to get fresh readings
-            async with BleakScanner(**scanner_kwargs) as scanner:
-                # Wait for some readings
-                for _ in range(5):
-                    # Scan for the specific device
-                    discovered = await scanner.find_device_by_address(
-                        device.address, timeout=1.0
-                    )
-                    if discovered:
-                        self.console.print(f"Current RSSI: {device.rssi} dBm")
-                    await asyncio.sleep(1)
+            # Scan for a few seconds to get fresh readings for Linux
+            if sys.platform.startswith("linux"):
+                # On Linux, use a different approach to avoid BlueZ errors
+                try:
+                    # Create a scanner without starting it immediately
+                    scanner = BleakScanner(**scanner_kwargs)
+
+                    # Collect readings over time without starting/stopping scanner multiple times
+                    for _ in range(5):
+                        # Just wait and let the discovery_callback update the device
+                        await asyncio.sleep(1.0)
+                        # Check if the device is still in our devices dictionary
+                        if device.address in self.devices:
+                            updated_device = self.devices[device.address]
+                            self.console.print(
+                                f"Current RSSI: {updated_device.rssi} dBm"
+                            )
+                        else:
+                            self.console.print(
+                                "[yellow]Device not in range, waiting...[/]"
+                            )
+                except Exception as e:
+                    self.console.print(f"[yellow]Warning during calibration: {e}[/]")
+            else:
+                # For other platforms, use the original approach
+                try:
+                    async with BleakScanner(**scanner_kwargs) as scanner:
+                        # Wait for some readings
+                        for _ in range(5):
+                            # Scan for the specific device
+                            discovered = await scanner.find_device_by_address(
+                                device.address, timeout=1.0
+                            )
+                            if discovered:
+                                self.console.print(f"Current RSSI: {device.rssi} dBm")
+                            await asyncio.sleep(1)
+                except Exception as e:
+                    self.console.print(f"[yellow]Warning during calibration: {e}[/]")
 
             if device.calibrate_distance(distance):
                 self.console.print(f"[bold green]Calibration successful:[/]")
@@ -1307,7 +1634,7 @@ class TagFinder:
             self.console.print("[bold red]Invalid distance value[/]")
 
     async def start_scan(self):
-        """Start BLE scanning"""
+        """Start BLE scanning with enhanced parameters for maximum range"""
         # Clear terminal before starting scan
         self.console.clear()
 
@@ -1315,191 +1642,141 @@ class TagFinder:
         self.devices = {}
         self.scanning = True
         self.selected_device = None
+        self.selection_mode = False
+        self.cursor_position = 0
 
         # Note: We intentionally don't reset device_ids here to maintain
         # the same IDs for devices discovered in subsequent scans
 
-        # Set up scanner with selected adapter if specified
+        # Set up scanner with advanced parameters
         scanner_kwargs = {}
+
+        # Use specific adapter if available
         if self.current_adapter:
             scanner_kwargs["adapter"] = self.current_adapter
 
+        # Apply advanced scanning parameters from settings or defaults
+        scan_settings = self.settings.get("scan_parameters", SCAN_PARAMETERS)
+
+        # Set scanning mode (active scans get more data but less range sometimes)
+        scanner_kwargs["scanning_mode"] = self.settings.get("scan_mode", SCAN_MODE)
+
+        # Set detection callback and timeout
+        scanner_kwargs["detection_callback"] = self.discovery_callback
+        scanner_kwargs["timeout"] = scan_settings.get(
+            "timeout", SCAN_PARAMETERS["timeout"]
+        )
+
+        # Set additional platform-specific parameters where possible
+        if hasattr(bleak.backends, "bluezdbus") and sys.platform.startswith("linux"):
+            # For Linux systems with BlueZ - can set more aggressive parameters
+            scanner_kwargs["bluez"] = {
+                "interval": scan_settings.get("interval", SCAN_PARAMETERS["interval"]),
+                "window": scan_settings.get("windown", SCAN_PARAMETERS["windown"]),
+                "passive": not scan_settings.get("active", SCAN_PARAMETERS["active"]),
+            }
+        elif hasattr(bleak.backends, "corebluetooth") and sys.platform == "darwin":
+            # For macOS systems - can set some CoreBluetooth parameters
+            # CoreBluetooth doesn't expose as many parameters as BlueZ
+            scanner_kwargs["cb"] = {
+                "use_bdaddr": True,  # Use Bluetooth address when available
+                "duration": SCAN_DURATION,  # Duration in seconds for scan
+            }
+
         try:
-            self.console.print("[green]Starting scan...[/]")
+            self.console.print("[green]Starting enhanced range scan...[/]")
+            self.console.print(
+                f"[yellow]Adapter: {self.current_adapter or 'Default'}[/]"
+            )
+            self.console.print(
+                f"[yellow]Mode: {scanner_kwargs.get('scanning_mode', 'Default')}[/]"
+            )
 
-            # Start the scanner in the background
-            async with BleakScanner(
-                detection_callback=self.discovery_callback, **scanner_kwargs
-            ) as scanner:
-                # Use Rich Live display to update the UI
-                with Live(self._update_ui(), refresh_per_second=4) as live:
-                    while self.scanning:
-                        # Update UI with our new scanning layout
-                        live.update(self._update_ui())
+            # Handle Linux BlueZ backend specifically to avoid InProgress errors
+            if sys.platform.startswith("linux"):
+                scanner = None
+                try:
+                    # Create scanner without starting it yet
+                    scanner = BleakScanner(**scanner_kwargs)
+                    # Start scanning explicitly
+                    await scanner.start()
+                    self.last_scan_refresh = time.time()
 
-                        # Clear input buffer if it's been more than 3 seconds since last keypress
-                        if (
-                            hasattr(self, "input_buffer")
-                            and self.input_buffer
-                            and time.time() - self.last_key_time > 3.0
-                        ):
-                            self.input_buffer = ""
+                    # Use Rich Live display to update the UI
+                    with Live(self._update_ui(), refresh_per_second=4) as live:
+                        while self.scanning:
+                            # Update UI with our new scanning layout
+                            live.update(self._update_ui())
 
-                        # Simple non-blocking keyboard input
-                        if sys.platform == "win32":
-                            # Windows-specific input handling
-                            if msvcrt.kbhit():
-                                key = msvcrt.getch().decode().lower()
-                                # Process key input
-                                if key == "q":
-                                    self.scanning = False
-                                # Back to all devices
-                                elif key == "b":
-                                    self.selected_device = None
-                                    self.input_buffer = ""  # Clear input buffer
-                                # Device selection (numeric keys)
-                                elif key.isdigit():
-                                    # Start buffer or append to existing
-                                    if (
-                                        time.time() - self.last_key_time < 2.0
-                                    ):  # Increased from 1.0 to 2.0 seconds
-                                        # Within 2 seconds, append to current buffer
-                                        self.input_buffer += key
-                                    else:
-                                        # Start new input buffer
-                                        self.input_buffer = key
+                            # Handle input processing
+                            await self._process_input()
 
-                                    self.last_key_time = time.time()
-
-                                    # Try to process the input buffer
-                                    try:
-                                        device_idx = int(self.input_buffer)
-
-                                        # Check if this device exists in our map
-                                        if device_idx in self.device_map:
-                                            # Valid device ID - select it
-                                            self.selected_device = self.device_map[
-                                                device_idx
-                                            ]
-                                            # Clear buffer only after successful selection
-                                            self.input_buffer = ""
-                                        # Important: do NOT clear the buffer if the device doesn't exist yet
-                                        # User might be typing a multi-digit ID
-                                    except ValueError:
-                                        # Invalid buffer content
-                                        pass
-                        else:
-                            # Unix-like systems (Mac/Linux)
-                            try:
-                                # Put terminal in raw mode to read keys without needing Enter
-                                import termios
-                                import tty
-
-                                # Save old terminal settings
-                                old_settings = termios.tcgetattr(sys.stdin)
+                            # Periodically refresh the scan on Linux
+                            if time.time() - self.last_scan_refresh > SCAN_DURATION:
                                 try:
-                                    # Set terminal to raw mode
-                                    tty.setraw(sys.stdin.fileno(), termios.TCSANOW)
-
-                                    # Check if there's input available without blocking
-                                    rlist, _, _ = select.select([sys.stdin], [], [], 0)
-                                    if rlist:
-                                        key = sys.stdin.read(1).lower()
-                                        # Process key input
-                                        if key == "q":
-                                            self.scanning = False
-                                        # Back to all devices
-                                        elif key == "b":
-                                            self.selected_device = None
-                                            self.input_buffer = ""  # Clear input buffer
-                                        # Device selection (numeric keys)
-                                        elif key.isdigit():
-                                            # Start buffer or append to existing
-                                            if (
-                                                time.time() - self.last_key_time < 5.0
-                                            ):  # Increased from 1.0 to 2.0 seconds
-                                                # Within 2 seconds, append to current buffer
-                                                self.input_buffer += key
-                                            else:
-                                                # Start new input buffer
-                                                self.input_buffer = key
-
-                                            self.last_key_time = time.time()
-
-                                            # Try to process the input buffer
-                                            try:
-                                                device_idx = int(self.input_buffer)
-
-                                                # Check if this device exists in our map
-                                                if device_idx in self.device_map:
-                                                    # Valid device ID - select it
-                                                    self.selected_device = (
-                                                        self.device_map[device_idx]
-                                                    )
-                                                    # Clear buffer only after successful selection
-                                                    self.input_buffer = ""
-                                                # Important: do NOT clear the buffer if the device doesn't exist yet
-                                                # User might be typing a multi-digit ID
-                                            except ValueError:
-                                                # Invalid buffer content
-                                                pass
-                                finally:
-                                    # Restore terminal settings
-                                    termios.tcsetattr(
-                                        sys.stdin, termios.TCSADRAIN, old_settings
+                                    # Restart scanner carefully to avoid BlueZ errors
+                                    await scanner.stop()
+                                    await asyncio.sleep(1.0)  # Allow BlueZ to settle
+                                    await scanner.start()
+                                    self.last_scan_refresh = time.time()
+                                    self.console.print(
+                                        "[yellow]Refreshing scan...[/]", end="\r"
                                     )
-                            except (ImportError, termios.error):
-                                # Fall back to regular input if terminal handling fails
-                                rlist, _, _ = select.select([sys.stdin], [], [], 0)
-                                if rlist:
-                                    key = sys.stdin.read(1).lower()
-                                    # Process key input
-                                    if key == "q":
-                                        self.scanning = False
-                                    # Back to all devices
-                                    elif key == "b":
-                                        self.selected_device = None
-                                        self.input_buffer = ""  # Clear input buffer
-                                    # Device selection (numeric keys)
-                                    elif key.isdigit():
-                                        # Start buffer or append to existing
-                                        if (
-                                            time.time() - self.last_key_time < 2.0
-                                        ):  # Increased from 1.0 to 2.0 seconds
-                                            # Within 2 seconds, append to current buffer
-                                            self.input_buffer += key
-                                        else:
-                                            # Start new input buffer
-                                            self.input_buffer = key
+                                except Exception as e:
+                                    self.console.print(
+                                        f"[yellow]Scan refresh warning: {e}[/]",
+                                        end="\r",
+                                    )
+                                    self.last_scan_refresh = (
+                                        time.time()
+                                    )  # Still update time to avoid rapid retries
 
-                                        self.last_key_time = time.time()
+                            # Short sleep to avoid high CPU usage
+                            await asyncio.sleep(0.1)
+                finally:
+                    # Ensure scanner is properly closed
+                    if scanner is not None:
+                        try:
+                            await scanner.stop()
+                        except Exception:
+                            pass
+            else:
+                # For non-Linux platforms, use the original approach
+                async with BleakScanner(**scanner_kwargs) as scanner:
+                    # Use Rich Live display to update the UI
+                    with Live(self._update_ui(), refresh_per_second=4) as live:
+                        while self.scanning:
+                            # Update UI with our new scanning layout
+                            live.update(self._update_ui())
 
-                                        # Try to process the input buffer
-                                        try:
-                                            device_idx = int(self.input_buffer)
+                            # Handle input processing
+                            await self._process_input()
 
-                                            # Check if this device exists in our map
-                                            if device_idx in self.device_map:
-                                                # Valid device ID - select it
-                                                self.selected_device = self.device_map[
-                                                    device_idx
-                                                ]
-                                                # Clear buffer only after successful selection
-                                                self.input_buffer = ""
-                                            # Important: do NOT clear the buffer if the device doesn't exist yet
-                                            # User might be typing a multi-digit ID
-                                        except ValueError:
-                                            # Invalid buffer content
-                                            pass
+                            # Periodically refresh the scanner to improve detection rate
+                            if hasattr(self, "last_scan_refresh"):
+                                time_since_refresh = (
+                                    time.time() - self.last_scan_refresh
+                                )
+                                if time_since_refresh > SCAN_DURATION:
+                                    # Restart scanner periodically to prevent device cache issues
+                                    await scanner.stop()
+                                    await asyncio.sleep(0.5)
+                                    await scanner.start()
+                                    self.last_scan_refresh = time.time()
+                                    self.console.print(
+                                        "[yellow]Refreshing scan...[/]", end="\r"
+                                    )
+                            else:
+                                self.last_scan_refresh = time.time()
 
-                        # Short sleep to avoid high CPU usage
-                        await asyncio.sleep(0.1)
+                            # Short sleep to avoid high CPU usage
+                            await asyncio.sleep(0.1)
         finally:
             # Clear the terminal when finishing scan
             self.console.clear()
 
             # Save results to history
-            self._save_history()
+            await self._save_history()
 
             # Handle calibration if flagged
             if (
@@ -1509,6 +1786,101 @@ class TagFinder:
             ):
                 await self.calibrate_device(self.devices[self.selected_device])
                 self.calibration_mode = False
+
+    async def _process_input(self):
+        """Process keyboard input non-blockingly"""
+        # Clear input buffer if it's been more than 3 seconds since last keypress
+        if (
+            hasattr(self, "input_buffer")
+            and self.input_buffer
+            and time.time() - self.last_key_time > 3.0
+        ):
+            self.input_buffer = ""
+
+        # Simple non-blocking keyboard input
+        if sys.platform == "win32":
+            # Windows-specific input handling
+            if msvcrt.kbhit():
+                key = msvcrt.getch().decode().lower()
+                await self._handle_key_input(key)
+        else:
+            # Unix-like systems (Mac/Linux)
+            try:
+                # Put terminal in raw mode to read keys without needing Enter
+                import termios
+                import tty
+
+                # Save old terminal settings
+                old_settings = termios.tcgetattr(sys.stdin)
+                try:
+                    # Set terminal to raw mode
+                    tty.setraw(sys.stdin.fileno(), termios.TCSANOW)
+
+                    # Check if there's input available without blocking
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0)
+                    if rlist:
+                        key = sys.stdin.read(1).lower()
+                        await self._handle_key_input(key)
+                finally:
+                    # Restore terminal settings
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            except (ImportError, termios.error):
+                # Fall back to regular input if terminal handling fails
+                rlist, _, _ = select.select([sys.stdin], [], [], 0)
+                if rlist:
+                    key = sys.stdin.read(1).lower()
+                    await self._handle_key_input(key)
+
+    async def _handle_key_input(self, key):
+        """Handle keyboard input during scanning"""
+        # Always handle these keys
+        if key == "q":
+            self.scanning = False
+        elif key == "b":
+            self.selected_device = None
+            self.input_buffer = ""  # Clear input buffer
+            self.selection_mode = False
+        elif key == "t":  # Enter tab selection mode
+            self.selection_mode = True
+            self.cursor_position = 0
+        elif key == "\t" or key == " ":  # Tab or space to navigate to next device
+            if (
+                self.selection_mode
+                and hasattr(self, "sorted_device_list")
+                and len(self.sorted_device_list) > 0
+            ):
+                self.cursor_position = (self.cursor_position + 1) % len(
+                    self.sorted_device_list
+                )
+        elif key == "\r" or key == "\n":  # Enter to select the device under cursor
+            if self.selection_mode and hasattr(self, "cursor_device"):
+                self.selected_device = self.cursor_device
+                self.selection_mode = False
+        elif key.isdigit():
+            # Start buffer or append to existing
+            if time.time() - self.last_key_time < 2.0:
+                # Within 2 seconds, append to current buffer
+                self.input_buffer += key
+            else:
+                # Start new input buffer
+                self.input_buffer = key
+
+            self.last_key_time = time.time()
+
+            # Try to process the input buffer
+            try:
+                device_idx = int(self.input_buffer)
+
+                # Check if this device exists in our map
+                if device_idx in self.device_map:
+                    # Valid device ID - select it
+                    self.selected_device = self.device_map[device_idx]
+                    # Clear buffer only after successful selection
+                    self.input_buffer = ""
+                    self.selection_mode = False
+            except ValueError:
+                # Invalid buffer content
+                pass
 
     def _update_ui(self) -> Layout:
         """Update the UI layout"""
@@ -1541,6 +1913,14 @@ class TagFinder:
                     f"\n[bold magenta]◉ SELECTING DEVICE ID: {self.input_buffer} ◉[/]"
                 )
 
+            # Show selection mode status
+            if self.selection_mode:
+                selection_info = f"\n[bold green]◉ TAB SELECTION MODE: Use Tab to navigate, Enter to select ◉[/]"
+                if not input_status:
+                    input_status = selection_info
+                else:
+                    input_status += selection_info
+
             # Show selected device info
             if self.selected_device and self.selected_device in self.devices:
                 selected_device = self.devices[self.selected_device]
@@ -1553,6 +1933,9 @@ class TagFinder:
                         "[bold cyan]Controls:[/]",
                         " [bold blue]q[/] - Quit scanning and save",
                         " [bold blue]0-9[/] - Select device by ID [italic](persistent IDs)[/]",
+                        " [bold blue]t[/] - Enter tab selection mode",
+                        " [bold blue]Tab/Space[/] - Navigate devices in tab mode",
+                        " [bold blue]Enter[/] - Select highlighted device",
                         " [bold blue]b[/] - Back to all devices",
                         "",
                         f"{input_status.strip() if input_status else ''}",
