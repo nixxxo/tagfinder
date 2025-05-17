@@ -1486,6 +1486,27 @@ class TagFinder:
         self.input_buffer = ""  # Buffer for multi-digit input
         self.last_key_time = time.time()  # Last time a key was pressed
 
+        # Column visibility settings
+        self.visible_columns = self.settings.get(
+            "visible_columns",
+            {
+                "name": True,
+                "type": True,
+                "mac": True,
+                "track_prob": True,
+                "manufacturer": True,
+                "rssi": True,
+                "signal": True,
+                "distance": True,
+                "last_seen": True,
+                "details": True,
+            },
+        )
+
+        # Sorting priority settings (default: track_prob → distance → last_seen)
+        if "sort_priority" not in self.settings:
+            self.settings["sort_priority"] = ["track_prob", "distance", "last_seen"]
+
         # Selection cursor properties
         self.cursor_position = 0  # Current position in device list for tabbing
         self.selection_mode = False  # Whether we're in tab-based selection mode
@@ -1520,8 +1541,35 @@ class TagFinder:
 
     def _save_settings(self):
         """Save settings to JSON file"""
+        # Save column visibility settings
+        self.settings["visible_columns"] = self.visible_columns
         with open(SETTINGS_FILE, "w") as f:
             json.dump(self.settings, f, indent=2)
+
+    def _update_sort_priority(self, sort_key: str, position: int = 0):
+        """Update the sort priority by moving a key to the specified position
+
+        Args:
+            sort_key: The key to prioritize
+            position: The position to place the key (0 = first priority)
+        """
+        # Get current priority list or use default
+        current_priority = self.settings.get(
+            "sort_priority", ["track_prob", "distance", "last_seen"]
+        )
+
+        # Remove the key if it already exists in the list
+        if sort_key in current_priority:
+            current_priority.remove(sort_key)
+
+        # Insert the key at the specified position
+        current_priority.insert(position, sort_key)
+
+        # Limit to 3 sort keys maximum to keep sorting reasonable
+        self.settings["sort_priority"] = current_priority[:3]
+
+        # Save settings
+        self._save_settings()
 
     def _load_history(self) -> List:
         """Load device history from JSON file"""
@@ -1698,8 +1746,24 @@ class TagFinder:
     def generate_device_table(self, devices: Dict[str, Device]) -> Table:
         """Generate a table of devices for display"""
         # Create a responsive table that adapts to available space
+
+        # Get current sort priority
+        sort_priority = self.settings.get(
+            "sort_priority", ["track_prob", "distance", "last_seen"]
+        )
+        sort_names = {
+            "track_prob": "Track probability",
+            "distance": "Distance",
+            "last_seen": "Last seen",
+            "rssi": "Signal strength",
+            "signal": "Signal quality",
+        }
+
+        # Format sort priority for display
+        sort_display = " → ".join([sort_names.get(p, p) for p in sort_priority])
+
         table = Table(
-            title="[bold]Bluetooth Devices[/] [dim](Sorted by: Last seen → Distance → Track probability)[/]",
+            title=f"[bold]Bluetooth Devices[/] [dim](Sorted by: {sort_display})[/]",
             box=ROUNDED,
             highlight=True,
             style="bold cyan",
@@ -1712,55 +1776,90 @@ class TagFinder:
             self.selected_device is not None and self.selected_device in self.devices
         )
 
-        # Add columns with responsive width settings
+        # Add columns with responsive width settings - respect visibility settings
+
+        # Name column is always visible (required for selection)
         table.add_column("Name", style="cyan", ratio=3, no_wrap=False)
-        table.add_column("Type", ratio=2, no_wrap=False)
 
-        # Always show MAC address column
-        table.add_column("MAC", ratio=1, no_wrap=False)
+        # Type column
+        if self.visible_columns.get("type", True):
+            table.add_column("Type", ratio=2, no_wrap=False)
 
-        # Add tracker probability column
-        table.add_column("Track Prob", justify="center", ratio=1)
+        # MAC address column
+        if self.visible_columns.get("mac", True):
+            table.add_column("MAC", ratio=1, no_wrap=False)
 
-        # Only show manufacturer column if space permits or no device is selected
-        if not has_selected or self.console.width > 100:
+        # Tracker probability column
+        if self.visible_columns.get("track_prob", True):
+            table.add_column("Track Prob", justify="center", ratio=1)
+
+        # Manufacturer column - respect both space constraints and visibility
+        if self.visible_columns.get("manufacturer", True) and (
+            not has_selected or self.console.width > 100
+        ):
             table.add_column("Manufacturer", ratio=1, no_wrap=False)
 
-        # Separate RSSI and Signal columns
-        table.add_column("RSSI", justify="right", ratio=1)
-        table.add_column("Signal", justify="right", ratio=1)  # Signal quality info
-        table.add_column("Distance", justify="right", ratio=1)
+        # RSSI column
+        if self.visible_columns.get("rssi", True):
+            table.add_column("RSSI", justify="right", ratio=1)
 
-        # Only show seen time column if no device is selected
-        if not has_selected or self.console.width > 120:
+        # Signal column
+        if self.visible_columns.get("signal", True):
+            table.add_column("Signal", justify="right", ratio=1)  # Signal quality info
+
+        # Distance column
+        if self.visible_columns.get("distance", True):
+            table.add_column("Distance", justify="right", ratio=1)
+
+        # Last seen column - respect both space constraints and visibility
+        if self.visible_columns.get("last_seen", True) and (
+            not has_selected or self.console.width > 120
+        ):
             table.add_column("Last Seen", justify="right", ratio=1)
 
-        # Always show details but adjust width based on available space
-        if self.console.width > 140:
-            table.add_column("Details", ratio=5, no_wrap=False)
-        else:
-            table.add_column("Details", ratio=4, no_wrap=False)
+        # Details column - respect both space constraints and visibility
+        if self.visible_columns.get("details", True):
+            if self.console.width > 140:
+                table.add_column("Details", ratio=5, no_wrap=False)
+            else:
+                table.add_column("Details", ratio=4, no_wrap=False)
 
-        # Create a sorting function that prioritizes:
-        # 1. Last seen (most recent first)
-        # 2. Distance (closest first)
-        # 3. Tracker probability (highest confidence first)
+        # Create a sorting function based on current sort priority
         def multi_sort_key(device):
-            # Negative last_seen puts most recent first
-            last_seen_key = -device.last_seen
+            # Get sort priority from settings or use default
+            sort_priority = self.settings.get(
+                "sort_priority", ["track_prob", "distance", "last_seen"]
+            )
 
-            # Distance (smaller values first)
-            distance_key = device.distance if device.distance < 100 else 100
+            # Initialize keys dictionary
+            keys = {}
 
             # Tracker probability (convert confidence to numeric value, lower is higher confidence)
             if device.is_airtag:
-                tracker_key = (
+                keys["track_prob"] = (
                     device.tracker_confidence
                 )  # Lower values = higher confidence
             else:
-                tracker_key = 999  # Non-trackers at bottom
+                keys["track_prob"] = 999  # Non-trackers at bottom
 
-            return (last_seen_key, distance_key, tracker_key)
+            # Distance (smaller values first)
+            keys["distance"] = device.distance if device.distance < 100 else 100
+
+            # Last seen (negative value puts most recent first)
+            keys["last_seen"] = -device.last_seen
+
+            # RSSI (stronger signal first)
+            keys["rssi"] = (
+                -device.smooth_rssi
+            )  # Negative RSSI value makes stronger signals first
+
+            # Signal quality (higher quality first)
+            keys["signal"] = (
+                -device.signal_quality
+            )  # Negative value makes higher quality first
+
+            # Create a tuple of keys based on current sort priority
+            return tuple(keys[k] for k in sort_priority if k in keys)
 
         # Sort devices by our multi-sort key
         sorted_devices = sorted(devices.values(), key=multi_sort_key)
@@ -1956,32 +2055,45 @@ class TagFinder:
             else:
                 tracker_prob_display = Text("0%", style="dim")
 
-            # Build row data based on which columns are enabled
-            row_data = [
-                name_display,
-                device.device_type,
-                mac_display,
-                tracker_prob_display,  # Add tracker probability
-            ]
+            # Build row data based on which columns are visible
+            row_data = [name_display]  # Name is always visible
 
-            # Add manufacturer column if it exists
-            if not has_selected or self.console.width > 100:
+            # Type column
+            if self.visible_columns.get("type", True):
+                row_data.append(device.device_type)
+
+            # MAC column
+            if self.visible_columns.get("mac", True):
+                row_data.append(mac_display)
+
+            # Tracker probability column
+            if self.visible_columns.get("track_prob", True):
+                row_data.append(tracker_prob_display)
+
+            # Manufacturer column - respect both space constraints and visibility
+            if self.visible_columns.get("manufacturer", True) and (
+                not has_selected or self.console.width > 100
+            ):
                 row_data.append(device.manufacturer)
 
-            # Always add RSSI, signal quality, and distance
-            row_data.extend(
-                [
-                    Text(rssi_str, style=f"{rssi_color} {style}"),
-                    Text(
-                        f"{signal_quality}",  # Simplified signal display
-                        style=f"{signal_color} {style}",
-                    ),
-                    distance,
-                ]
-            )
+            # RSSI column
+            if self.visible_columns.get("rssi", True):
+                row_data.append(Text(rssi_str, style=f"{rssi_color} {style}"))
 
-            # Add seen time if column exists, with color coding
-            if not has_selected or self.console.width > 120:
+            # Signal column
+            if self.visible_columns.get("signal", True):
+                row_data.append(
+                    Text(f"{signal_quality}", style=f"{signal_color} {style}")
+                )
+
+            # Distance column
+            if self.visible_columns.get("distance", True):
+                row_data.append(distance)
+
+            # Last seen column - respect both space constraints and visibility
+            if self.visible_columns.get("last_seen", True) and (
+                not has_selected or self.console.width > 120
+            ):
                 # Color code last seen times
                 if time_since_last_seen < 30:
                     seen_style = "green"  # Very recent
@@ -1992,8 +2104,9 @@ class TagFinder:
 
                 row_data.append(Text(seen_time, style=f"{seen_style}"))
 
-            # Always add details
-            row_data.append(details)
+            # Details column
+            if self.visible_columns.get("details", True):
+                row_data.append(details)
 
             # Add the row with the correct data
             table.add_row(*row_data, style=style)
@@ -3833,6 +3946,58 @@ class TagFinder:
             if self.selection_mode and hasattr(self, "cursor_device"):
                 self.selected_device = self.cursor_device
                 self.selection_mode = False
+        # Column visibility toggle keys
+        elif key == "c":  # Toggle type column
+            self.visible_columns["type"] = not self.visible_columns.get("type", True)
+            self._save_settings()
+        elif key == "m":  # Toggle MAC address column
+            self.visible_columns["mac"] = not self.visible_columns.get("mac", True)
+            self._save_settings()
+        elif key == "p":  # Toggle tracker probability column
+            self.visible_columns["track_prob"] = not self.visible_columns.get(
+                "track_prob", True
+            )
+            self._save_settings()
+        elif key == "f":  # Toggle manufacturer column
+            self.visible_columns["manufacturer"] = not self.visible_columns.get(
+                "manufacturer", True
+            )
+            self._save_settings()
+        elif key == "r":  # Toggle RSSI column
+            self.visible_columns["rssi"] = not self.visible_columns.get("rssi", True)
+            self._save_settings()
+        elif key == "s":  # Toggle signal column
+            self.visible_columns["signal"] = not self.visible_columns.get(
+                "signal", True
+            )
+            self._save_settings()
+        elif key == "d":  # Toggle distance column
+            self.visible_columns["distance"] = not self.visible_columns.get(
+                "distance", True
+            )
+            self._save_settings()
+        elif key == "l":  # Toggle last seen column
+            self.visible_columns["last_seen"] = not self.visible_columns.get(
+                "last_seen", True
+            )
+            self._save_settings()
+        elif key == "i":  # Toggle details column
+            self.visible_columns["details"] = not self.visible_columns.get(
+                "details", True
+            )
+            self._save_settings()
+
+        # Sort priority controls - using Shift+Number combination
+        elif key == "!":  # Shift+1: Set track probability as first sort key
+            self._update_sort_priority("track_prob", 0)
+        elif key == "@":  # Shift+2: Set distance as first sort key
+            self._update_sort_priority("distance", 0)
+        elif key == "#":  # Shift+3: Set last seen as first sort key
+            self._update_sort_priority("last_seen", 0)
+        elif key == "$":  # Shift+4: Set signal strength (RSSI) as first sort key
+            self._update_sort_priority("rssi", 0)
+        elif key == "%":  # Shift+5: Set signal quality as first sort key
+            self._update_sort_priority("signal", 0)
         elif key.isdigit():
             # Start buffer or append to existing
             if time.time() - self.last_key_time < 2.0:
@@ -3923,6 +4088,24 @@ class TagFinder:
                         " [bold blue]Enter[/] - Select highlighted device",
                         " [bold blue]b[/] - Back to all devices",
                         "",
+                        "[bold cyan]Column Visibility Controls:[/]",
+                        " [bold blue]c[/] - Toggle Type column",
+                        " [bold blue]m[/] - Toggle MAC column",
+                        " [bold blue]p[/] - Toggle Track Prob column",
+                        " [bold blue]f[/] - Toggle Manufacturer column",
+                        " [bold blue]r[/] - Toggle RSSI column",
+                        " [bold blue]s[/] - Toggle Signal column",
+                        " [bold blue]d[/] - Toggle Distance column",
+                        " [bold blue]l[/] - Toggle Last Seen column",
+                        " [bold blue]i[/] - Toggle Details column",
+                        "",
+                        "[bold cyan]Sorting Controls:[/]",
+                        " [bold blue]Shift+1[/] - Sort by tracking probability",
+                        " [bold blue]Shift+2[/] - Sort by distance",
+                        " [bold blue]Shift+3[/] - Sort by last seen time",
+                        " [bold blue]Shift+4[/] - Sort by signal strength",
+                        " [bold blue]Shift+5[/] - Sort by signal quality",
+                        "",
                         f"{input_status.strip() if input_status else ''}",
                     ]
                 ),
@@ -3951,6 +4134,101 @@ class TagFinder:
                     else:
                         proximity_info = f"\n[bold]Tracking:[/] [yellow]◆ Stable[/]"
 
+            # Prepare column visibility status
+            column_status = []
+            column_names = {
+                "type": "Type",
+                "mac": "MAC",
+                "track_prob": "Track Prob",
+                "manufacturer": "Manufacturer",
+                "rssi": "RSSI",
+                "signal": "Signal",
+                "distance": "Distance",
+                "last_seen": "Last Seen",
+                "details": "Details",
+            }
+
+            for key, display_name in column_names.items():
+                is_visible = self.visible_columns.get(key, True)
+                status = f"[green]✓[/]" if is_visible else f"[red]✗[/]"
+                column_status.append(f"{display_name}: {status}")
+
+                # Format column visibility status in a compact way
+            # Check terminal width to determine how many columns to use
+            if self.console.width > 100:
+                # For wider terminals, use 3 columns
+                vis_col1 = column_status[:3]
+                vis_col2 = column_status[3:6]
+                vis_col3 = column_status[6:]
+
+                vis_status = []
+                for i in range(max(len(vis_col1), len(vis_col2), len(vis_col3))):
+                    row = []
+                    if i < len(vis_col1):
+                        row.append(vis_col1[i])
+                    else:
+                        row.append("")
+
+                    if i < len(vis_col2):
+                        row.append(vis_col2[i])
+                    else:
+                        row.append("")
+
+                    if i < len(vis_col3):
+                        row.append(vis_col3[i])
+                    else:
+                        row.append("")
+
+                    vis_status.append(" | ".join([col for col in row if col]))
+            else:
+                # For narrower terminals, use 2 columns to fit better
+                half = len(column_status) // 2 + len(column_status) % 2
+                vis_col1 = column_status[:half]
+                vis_col2 = column_status[half:]
+
+                vis_status = []
+                for i in range(max(len(vis_col1), len(vis_col2))):
+                    row = []
+                    if i < len(vis_col1):
+                        row.append(vis_col1[i])
+                    else:
+                        row.append("")
+
+                    if i < len(vis_col2):
+                        row.append(vis_col2[i])
+                    else:
+                        row.append("")
+
+                    vis_status.append(" | ".join([col for col in row if col]))
+
+            # Format current sort order for display
+            sort_priority = self.settings.get(
+                "sort_priority", ["track_prob", "distance", "last_seen"]
+            )
+            sort_names = {
+                "track_prob": "Track probability",
+                "distance": "Distance",
+                "last_seen": "Last seen",
+                "rssi": "Signal strength",
+                "signal": "Signal quality",
+            }
+
+            # Choose display format based on available width
+            if self.console.width > 140:
+                # For wide screens, use verbose format with priorities
+                sort_display = []
+                for i, key in enumerate(sort_priority[:3]):
+                    priority = ["1st", "2nd", "3rd"][i]
+                    sort_display.append(
+                        f"{priority}: [cyan]{sort_names.get(key, key)}[/]"
+                    )
+            else:
+                # For narrower screens, use a more compact format
+                sort_display = [
+                    f"1:[cyan]{sort_names.get(sort_priority[0], sort_priority[0])}[/]",
+                    f"2:[cyan]{sort_names.get(sort_priority[1], sort_priority[1])}[/] 3:[cyan]{sort_names.get(sort_priority[2], sort_priority[2])}[/]",
+                ]
+
             settings_panel = Panel(
                 "\n".join(
                     [
@@ -3964,6 +4242,12 @@ class TagFinder:
                         f"[bold]Range mode:[/] [{range_color}]{range_mode}[/]",
                         f"[bold]Adapter:[/] {self.current_adapter or 'Default'}",
                         "",
+                        "[bold cyan]Visible Columns:[/]",
+                        *vis_status,
+                        "",
+                        "[bold cyan]Sort Priority:[/]",
+                        *sort_display,
+                        "",
                         f"{selected_info.strip() if selected_info else ''}",
                         f"{proximity_info if proximity_info else ''}",
                     ]
@@ -3974,15 +4258,137 @@ class TagFinder:
                 expand=True,
             )
 
-            # Create a layout for the top area that holds both panels side by side
-            top_panel = Layout()
-            top_panel.split_row(
-                Layout(name="controls_panel", ratio=1),
-                Layout(name="settings_panel", ratio=1),
+            # Calculate minimum required height for controls panel
+            # Base size + column controls + sorting controls + device selection info
+            controls_panel_height = 9 + 9 + 9 + (2 if input_status else 0)
+
+            # Calculate minimum required height for settings panel
+            # Basic settings + column visibility + sort priority + device details
+            settings_panel_height = (
+                9
+                + len(vis_status)
+                + len(sort_display)
+                + (2 if selected_info else 0)
+                + (2 if proximity_info else 0)
             )
 
-            top_panel["controls_panel"].update(controls_panel)
-            top_panel["settings_panel"].update(settings_panel)
+            # Determine minimum required height for both panels
+            min_panel_height = max(controls_panel_height, settings_panel_height)
+
+            # Choose layout based on available width
+            top_panel = Layout()
+
+            if self.console.width > 120:
+                # For wide screens, use side-by-side layout
+                top_panel.split_row(
+                    Layout(name="controls_panel", ratio=1),
+                    Layout(name="settings_panel", ratio=1),
+                )
+
+                top_panel["controls_panel"].update(controls_panel)
+                top_panel["settings_panel"].update(settings_panel)
+            else:
+                # For narrower screens, create a combined panel with all info
+                combined_content = []
+
+                # Core controls section
+                combined_content.extend(
+                    [
+                        "[bold cyan]Controls:[/]",
+                        " [bold blue]q[/] - Quit  [bold blue]0-9[/] - Select device  [bold blue]t[/] - Tab mode",
+                        " [bold blue]Tab/Space[/] - Navigate  [bold blue]Enter[/] - Select  [bold blue]b[/] - Back",
+                        "",
+                    ]
+                )
+
+                # Column controls in compact format
+                combined_content.extend(
+                    [
+                        "[bold cyan]Columns:[/] [dim](toggle with key)[/]",
+                        " [bold blue]c[/]-Type [bold blue]m[/]-MAC [bold blue]p[/]-Track [bold blue]f[/]-Mfr [bold blue]r[/]-RSSI",
+                        " [bold blue]s[/]-Signal [bold blue]d[/]-Dist [bold blue]l[/]-Seen [bold blue]i[/]-Details",
+                        "",
+                    ]
+                )
+
+                # Sorting controls
+                combined_content.extend(
+                    [
+                        "[bold cyan]Sort:[/] [dim](Shift+number)[/]",
+                        " [bold blue]1[/]-Track [bold blue]2[/]-Dist [bold blue]3[/]-Time [bold blue]4[/]-RSSI [bold blue]5[/]-Quality",
+                        "",
+                    ]
+                )
+
+                # Current settings
+                combined_content.extend(
+                    [
+                        f"[bold]Status:[/] [green]Scanning...[/] ({scan_duration}) - {device_count} devices",
+                        f"[bold]Find My:[/] {airtag_mode} [bold]Adaptive:[/] {adaptive_mode} [bold]Calib:[/] {calibration_mode}",
+                        f"[bold]Range:[/] [{range_color}]{range_mode}[/] [bold]Adapter:[/] {self.current_adapter or 'Default'}",
+                        "",
+                    ]
+                )
+
+                # Add sort priority information in a compact way
+                sort_info = []
+                for i, key in enumerate(sort_priority[:3]):
+                    priority = ["1st", "2nd", "3rd"][i]
+                    sort_name = sort_names.get(key, key)
+                    # Truncate long names
+                    if len(sort_name) > 12:
+                        sort_name = sort_name[:10] + ".."
+                    sort_info.append(f"{key.split('_')[0]}")
+
+                combined_content.extend(
+                    [
+                        f"[bold]Sort:[/] [cyan]1:{sort_info[0]}[/] → [cyan]2:{sort_info[1]}[/] → [cyan]3:{sort_info[2]}[/]",
+                        "",
+                    ]
+                )
+
+                # Device selection status
+                if input_status:
+                    combined_content.append(input_status.strip())
+
+                if selected_info:
+                    combined_content.append(selected_info.strip())
+
+                if proximity_info:
+                    combined_content.append(proximity_info.strip())
+
+                # Create the compact panel
+                # If we have a lot of content, use a scrollable panel
+                total_content_height = len(combined_content)
+
+                # Check if we need a scrollable panel (more than ~20 lines of content)
+                if total_content_height > 20:
+                    from rich.console import Group
+
+                    # Create a scrollable group with all content
+                    scrollable_content = Group(
+                        *[Text(line) for line in combined_content]
+                    )
+
+                    compact_panel = Panel(
+                        scrollable_content,
+                        title="[bold blue]TagFinder Controls & Settings[/] [dim](Scrollable)[/]",
+                        border_style="blue",
+                        box=ROUNDED,
+                        expand=True,
+                    )
+                else:
+                    # Standard panel for normal content amount
+                    compact_panel = Panel(
+                        "\n".join(combined_content),
+                        title="[bold blue]TagFinder Controls & Settings[/]",
+                        border_style="blue",
+                        box=ROUNDED,
+                        expand=True,
+                    )
+
+                # Use a single layout with the compact panel
+                top_panel.update(compact_panel)
 
             # Create the main scanning layout
             if self.selected_device and self.selected_device in self.devices:
@@ -4018,8 +4424,24 @@ class TagFinder:
                 return self.generate_proximity_view(selected_device)
             else:
                 # Normal layout when no device is selected
+                # Calculate the best panel height based on screen size and content
+                if self.console.width > 120:
+                    # For wider screens with side-by-side panels
+                    min_height = max(
+                        min_panel_height, 24
+                    )  # At least 24 lines for side-by-side panels
+                else:
+                    # For narrower screens with compact layout
+                    min_height = max(
+                        16, min(22, len(combined_content) + 2)
+                    )  # Content height + panel borders
+
+                # Ensure the controls area doesn't take more than 40% of the screen height
+                max_height = int(self.console.height * 0.5)
+                panel_height = min(min_height, max_height)
+
                 scanning_layout.split(
-                    Layout(name="controls", size=12),
+                    Layout(name="controls", size=panel_height),
                     Layout(name="devices", ratio=1),
                 )
 
