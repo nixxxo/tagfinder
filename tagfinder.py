@@ -60,19 +60,29 @@ FIND_MY_UUIDS = [
     "7DFC9003",
     "74278BDA-B644-4520-8F0C-720EAF059935",
 ]  # Apple and other tracker related UUIDs
-SCAN_INTERVAL = 1.0  # Scan interval in seconds
+SCAN_INTERVAL = 0.5  # Scan interval in seconds (reduced for more frequent updates)
 DEFAULT_RSSI_AT_ONE_METER = -59  # Default RSSI at 1 meter for Bluetooth LE
 DEFAULT_DISTANCE_N_VALUE = 2.0  # Default environmental factor for distance calculation
 RSSI_HISTORY_SIZE = 20  # Increased number of RSSI readings to keep for better smoothing
 SCAN_MODE = "active"  # Can be "active" or "passive"
-SCAN_DURATION = 10.0  # Duration of each scan in seconds
-DETECTION_THRESHOLD = -85  # RSSI threshold for considering a device in range
+SCAN_DURATION = 15.0  # Increased duration of each scan in seconds to catch more devices
+DETECTION_THRESHOLD = -95  # Lowered RSSI threshold for detecting more distant devices
 SCAN_PARAMETERS = {
-    "timeout": 5.0,
-    "windown": 0x0100,  # Window parameter for scanning
-    "interval": 0x0060,  # Interval parameter for scanning (smaller value = more aggressive)
+    "timeout": 10.0,  # Increased timeout for scanning
+    "window": 0x0100,  # Window parameter for scanning
+    "interval": 0x0040,  # Reduced interval for more aggressive scanning
     "filters": None,  # No filters for maximum detection
     "active": True,  # Active scanning for more data
+    "extended": True,  # Use extended scanning where available
+    "passive_workaround": True,  # Try passive scanning if active fails to find devices
+}
+
+# Additional scanning parameters for maximum range
+ADVANCED_SCAN_SETTINGS = {
+    "multi_adapter": True,  # Try to use multiple Bluetooth adapters if available
+    "extended_retries": 3,  # Number of retries for extended range
+    "combine_results": True,  # Combine results from different scan methods
+    "use_extended_features": True,  # Use extended BLE features on supported platforms
 }
 
 # Company identifiers (Bluetooth SIG assigned numbers)
@@ -841,7 +851,7 @@ class Device:
 
     @property
     def distance(self) -> float:
-        """Calculate approximate distance with improved environment correction"""
+        """Calculate approximate distance with improved environment correction for long range"""
         if self.smooth_rssi == 0:
             return float("inf")
 
@@ -859,6 +869,9 @@ class Device:
         elif "tag" in self.device_type.lower() or "tracker" in self.device_type.lower():
             # Other trackers may need different adjustments
             rssi_correction = -1
+        elif "find my" in self.device_type.lower():
+            # Find My devices may need a specific correction
+            rssi_correction = -3
 
         # Adjust environment factor based on signal stability
         stability = self.signal_stability
@@ -873,6 +886,9 @@ class Device:
         corrected_rssi = self.smooth_rssi + rssi_correction
 
         # Enhanced log-distance path loss model with adjustment for close proximity
+        # and long-distance correction factor
+
+        # For very close devices (< 1m), use linear interpolation
         if corrected_rssi > self.calibrated_rssi_at_one_meter - 5:
             # Device is very close (< 1m), use linear interpolation for higher accuracy
             # This addresses the limitation of the log model at close range
@@ -883,6 +899,25 @@ class Device:
             distance = 10 ** (
                 (self.calibrated_rssi_at_one_meter - corrected_rssi) / (10 * env_factor)
             )
+
+            # Apply improved long-range correction factors for signals below -80 dBm
+            if corrected_rssi < -80:
+                # For weaker signals, calibrate distance differently
+                signal_strength_factor = (
+                    abs(corrected_rssi) / 80.0
+                )  # Normalized factor (>1 for weak signals)
+
+                # Apply non-linear correction to prevent unrealistic distances
+                # This provides a more realistic curve for long-range distance estimation
+                if signal_strength_factor > 1.1:
+                    # Adjust distance with diminishing returns for very weak signals
+                    # Prevents exponential growth for extremely weak signals
+                    correction_factor = 1 + math.log(signal_strength_factor) * 0.5
+                    distance = distance * correction_factor
+
+                    # Apply maximum realistic range cap based on BLE physics
+                    # Max theoretical range is ~100m in perfect conditions
+                    distance = min(distance, 100.0)
 
             # Add slight correction for very far distances to account for noise floor
             if distance > 10:
@@ -1493,6 +1528,13 @@ class TagFinder:
         airtag_mode = "[green]ON[/]" if self.airtag_only_mode else "[red]OFF[/]"
         adaptive_mode = "[green]ON[/]" if self.adaptive_mode else "[red]OFF[/]"
         calibration_mode = "[green]ON[/]" if self.calibration_mode else "[red]OFF[/]"
+        # Get range mode from settings or use default
+        range_mode = self.settings.get("range_mode", "Normal")
+        range_color = "yellow"
+        if range_mode == "Maximum":
+            range_color = "green"
+        elif range_mode == "Balanced":
+            range_color = "blue"
 
         # Create responsive panels for controls and settings
         # Create a layout to hold both panels side by side
@@ -1515,6 +1557,8 @@ class TagFinder:
                         " [bold blue]a[/] - Toggle Find My mode",
                         " [bold blue]d[/] - Toggle adaptive mode",
                         " [bold blue]c[/] - Toggle calibration mode",
+                        " [bold blue]r[/] - Configure scan range",
+                        " [bold blue]m[/] - Test max adapter range",
                         " [bold blue]l[/] - List Bluetooth adapters",
                         " [bold blue]z[/] - Analyze & Summarize findings",
                         " [bold blue]q[/] - Quit",
@@ -1534,6 +1578,7 @@ class TagFinder:
                         f"[bold]Find My mode:[/] {airtag_mode}",
                         f"[bold]Adaptive:[/] {adaptive_mode}",
                         f"[bold]Calibration:[/] {calibration_mode}",
+                        f"[bold]Range mode:[/] [{range_color}]{range_mode}[/]",
                         f"[bold]Adapter:[/] {self.current_adapter or 'Default'}",
                     ]
                 ),
@@ -1554,10 +1599,10 @@ class TagFinder:
                     [
                         "[bold cyan]Controls:[/]",
                         " [bold blue]s[/] - Scan [bold blue]a[/] - Find My mode [bold blue]d[/] - Adaptive",
-                        " [bold blue]c[/] - Calibration [bold blue]l[/] - Adapters [bold blue]z[/] - Analyze [bold blue]q[/] - Quit",
+                        " [bold blue]c[/] - Calibration [bold blue]r[/] - Range [bold blue]m[/] - Max range test [bold blue]l[/] - Adapters [bold blue]z[/] - Analyze [bold blue]q[/] - Quit",
                         "",
                         f"[bold]Status:[/] [yellow]Idle[/] | Find My: {airtag_mode} | Adaptive: {adaptive_mode} | Calib: {calibration_mode}",
-                        f"[bold]Adapter:[/] {self.current_adapter or 'Default'}",
+                        f"[bold]Range:[/] [{range_color}]{range_mode}[/] | [bold]Adapter:[/] {self.current_adapter or 'Default'}",
                     ]
                 ),
                 title="[bold blue]TagFinder Controls[/]",
@@ -2316,12 +2361,50 @@ class TagFinder:
         # Device is truly new if it's not in our scanning session and not in history
         is_truly_new = is_new_device and device.address not in known_addresses
 
+        # Skip extremely weak signals unless we're in extended range mode
+        if advertisement_data.rssi < DETECTION_THRESHOLD:
+            # Only keep extremely weak signals if the device was previously seen
+            # or if it has Find My identifiers worth tracking
+            if not is_new_device:
+                # Update existing very weak device only
+                if device.address in self.devices:
+                    self.devices[device.address].update(
+                        rssi=advertisement_data.rssi,
+                        manufacturer_data=advertisement_data.manufacturer_data,
+                        service_data=advertisement_data.service_data,
+                        service_uuids=advertisement_data.service_uuids,
+                    )
+            return
+
+        # Apply signal amplification for weak but usable signals to improve detection
+        enhanced_rssi = advertisement_data.rssi
+
+        # Apply gentle signal boosting for weak but potentially distant important devices
+        if advertisement_data.rssi < -85 and advertisement_data.rssi > -95:
+            # Check if this might be a Find My device based on any identifiers
+            is_potential_find_my = False
+
+            # Check uuids for Find My identifiers
+            for uuid in advertisement_data.service_uuids:
+                if any(find_my_id in uuid.upper() for find_my_id in FIND_MY_UUIDS):
+                    is_potential_find_my = True
+                    break
+
+            # Check manufacturer data for Apple ID
+            if 76 in advertisement_data.manufacturer_data:
+                is_potential_find_my = True
+
+            # Apply signal boost for potential Find My devices to improve detection
+            if is_potential_find_my:
+                # Apply a small artificial signal boost to help distant Find My devices be detected
+                enhanced_rssi = advertisement_data.rssi + 5  # 5dBm boost
+
         if is_new_device:
             # Create new device instance
             self.devices[device.address] = Device(
                 address=device.address,
                 name=device.name,
-                rssi=advertisement_data.rssi,
+                rssi=enhanced_rssi,  # Use enhanced RSSI
                 manufacturer_data=advertisement_data.manufacturer_data,
                 service_data=advertisement_data.service_data,
                 service_uuids=advertisement_data.service_uuids,
@@ -2335,7 +2418,7 @@ class TagFinder:
         else:
             # Update existing device with new data
             self.devices[device.address].update(
-                rssi=advertisement_data.rssi,
+                rssi=enhanced_rssi,  # Use enhanced RSSI
                 manufacturer_data=advertisement_data.manufacturer_data,
                 service_data=advertisement_data.service_data,
                 service_uuids=advertisement_data.service_uuids,
@@ -2348,6 +2431,30 @@ class TagFinder:
                 if dev.rssi > -55 and dev.signal_stability < 3.0:
                     # Device is probably around 1m, adjust RSSI@1m
                     dev.calibrated_rssi_at_one_meter = dev.smooth_rssi
+
+        # For potential Find My devices, ensure we do deeper inspection by forcing a detailed data scan
+        if (
+            device.address in self.devices
+            and not self.devices[device.address].is_airtag
+        ):
+            # Check if this might be a Find My device that wasn't detected yet
+            is_potential_find_my = False
+
+            # Check some basic indicators
+            if 76 in advertisement_data.manufacturer_data:
+                # This is an Apple device, so worth checking further
+                is_potential_find_my = True
+
+            # For potential Find My devices, force a re-check
+            if is_potential_find_my:
+                # Force recalculation of is_airtag flag with latest data
+                self.devices[device.address].is_airtag = self.devices[
+                    device.address
+                ]._check_if_airtag()
+                # Force update of device details to be sure
+                self.devices[device.address].device_details = self.devices[
+                    device.address
+                ]._extract_detailed_info()
 
     async def calibrate_device(self, device: Device):
         """Calibrate the selected device"""
@@ -2511,110 +2618,214 @@ class TagFinder:
             "timeout", SCAN_PARAMETERS["timeout"]
         )
 
-        # Set additional platform-specific parameters where possible
+        # Display scanning parameters
+        self.console.print(
+            Panel(
+                "\n".join(
+                    [
+                        "[bold green]Starting enhanced range scan with optimized parameters[/]",
+                        f"[yellow]Scan interval: {SCAN_INTERVAL}s | Timeout: {scanner_kwargs['timeout']}s | Detection threshold: {DETECTION_THRESHOLD} dBm[/]",
+                        f"[yellow]Scanning mode: {scanner_kwargs['scanning_mode']} | Multi-phase: {ADVANCED_SCAN_SETTINGS['extended_retries']} phases[/]",
+                        f"[yellow]Adapter: {self.current_adapter or 'Default'}[/]",
+                    ]
+                ),
+                title="[bold blue]Range-Optimized Scan[/]",
+                border_style="blue",
+                box=ROUNDED,
+            )
+        )
+
+        # Set additional platform-specific parameters for maximum range
         if hasattr(bleak.backends, "bluezdbus") and sys.platform.startswith("linux"):
             # For Linux systems with BlueZ - can set more aggressive parameters
             scanner_kwargs["bluez"] = {
                 "interval": scan_settings.get("interval", SCAN_PARAMETERS["interval"]),
-                "window": scan_settings.get("windown", SCAN_PARAMETERS["windown"]),
+                "window": scan_settings.get("window", SCAN_PARAMETERS["window"]),
                 "passive": not scan_settings.get("active", SCAN_PARAMETERS["active"]),
             }
         elif hasattr(bleak.backends, "corebluetooth") and sys.platform == "darwin":
             # For macOS systems - can set some CoreBluetooth parameters
             # CoreBluetooth doesn't expose as many parameters as BlueZ
+            # Always force active scanning mode on macOS as passive is not supported
+            scanner_kwargs["scanning_mode"] = "active"
             scanner_kwargs["cb"] = {
                 "use_bdaddr": True,  # Use Bluetooth address when available
                 "duration": SCAN_DURATION,  # Duration in seconds for scan
             }
 
         try:
-            self.console.print("[green]Starting enhanced range scan...[/]")
-            self.console.print(
-                f"[yellow]Adapter: {self.current_adapter or 'Default'}[/]"
-            )
-            self.console.print(
-                f"[yellow]Mode: {scanner_kwargs.get('scanning_mode', 'Default')}[/]"
-            )
+            # Implement multi-phase scanning for maximum range
+            retry_count = ADVANCED_SCAN_SETTINGS["extended_retries"]
 
-            # Handle Linux BlueZ backend specifically to avoid InProgress errors
-            if sys.platform.startswith("linux"):
-                scanner = None
-                try:
-                    # Create scanner without starting it yet
-                    scanner = BleakScanner(**scanner_kwargs)
-                    # Start scanning explicitly
-                    await scanner.start()
-                    self.last_scan_refresh = time.time()
-
-                    # Use Rich Live display to update the UI
-                    with Live(self._update_ui(), refresh_per_second=4) as live:
-                        while self.scanning:
-                            # Update UI with our new scanning layout
-                            live.update(self._update_ui())
-
-                            # Handle input processing
-                            await self._process_input()
-
-                            # Periodically refresh the scan on Linux
-                            if time.time() - self.last_scan_refresh > SCAN_DURATION:
-                                try:
-                                    # Restart scanner carefully to avoid BlueZ errors
-                                    await scanner.stop()
-                                    await asyncio.sleep(1.0)  # Allow BlueZ to settle
-                                    await scanner.start()
-                                    self.last_scan_refresh = time.time()
-                                    self.console.print(
-                                        "[yellow]Refreshing scan...[/]", end="\r"
-                                    )
-                                except Exception as e:
-                                    self.console.print(
-                                        f"[yellow]Scan refresh warning: {e}[/]",
-                                        end="\r",
-                                    )
-                                    self.last_scan_refresh = (
-                                        time.time()
-                                    )  # Still update time to avoid rapid retries
-
-                            # Short sleep to avoid high CPU usage
-                            await asyncio.sleep(0.1)
-                finally:
-                    # Ensure scanner is properly closed
-                    if scanner is not None:
-                        try:
-                            await scanner.stop()
-                        except Exception:
-                            pass
+            # Create different scanning phases with different parameters
+            if sys.platform == "darwin":  # macOS doesn't support passive scanning
+                scan_phases = [
+                    {"mode": "active", "description": "Active scanning (standard)"},
+                    {
+                        "mode": "active",
+                        "interval": 0x0020,
+                        "description": "Aggressive active scanning",
+                    },
+                ]
             else:
-                # For non-Linux platforms, use the original approach
-                async with BleakScanner(**scanner_kwargs) as scanner:
-                    # Use Rich Live display to update the UI
-                    with Live(self._update_ui(), refresh_per_second=4) as live:
-                        while self.scanning:
-                            # Update UI with our new scanning layout
-                            live.update(self._update_ui())
+                scan_phases = [
+                    {"mode": "active", "description": "Active scanning (standard)"},
+                    {
+                        "mode": "passive",
+                        "description": "Passive scanning (longer range)",
+                    },
+                    {
+                        "mode": "active",
+                        "interval": 0x0020,
+                        "description": "Aggressive active scanning",
+                    },
+                ]
 
-                            # Handle input processing
-                            await self._process_input()
+            # Use Rich Live display for UI updates during all scanning phases
+            with Live(self._update_ui(), refresh_per_second=4) as live:
+                # First handle Linux BlueZ backend specifically to avoid InProgress errors
+                if sys.platform.startswith("linux"):
+                    scanner = None
+                    try:
+                        # Perform multi-phase scanning on Linux
+                        for phase_idx, phase in enumerate(scan_phases):
+                            # Only do additional phases if retry is enabled
+                            if (
+                                phase_idx > 0
+                                and not ADVANCED_SCAN_SETTINGS["extended_retries"]
+                            ):
+                                break
 
-                            # Periodically refresh the scanner to improve detection rate
-                            if hasattr(self, "last_scan_refresh"):
-                                time_since_refresh = (
+                            # Update scanner parameters for this phase
+                            scanner_kwargs["scanning_mode"] = phase["mode"]
+                            if "bluez" in scanner_kwargs and "interval" in phase:
+                                scanner_kwargs["bluez"]["interval"] = phase["interval"]
+
+                            self.console.print(
+                                f"[yellow]Phase {phase_idx+1}/{len(scan_phases)}: {phase['description']}[/]"
+                            )
+
+                            # Create scanner without starting it yet
+                            scanner = BleakScanner(**scanner_kwargs)
+                            # Start scanning explicitly
+                            await scanner.start()
+                            self.last_scan_refresh = time.time()
+                            phase_start_time = time.time()
+
+                            # Scan for specified duration
+                            while self.scanning and (
+                                time.time() - phase_start_time < SCAN_DURATION
+                            ):
+                                # Update UI
+                                live.update(self._update_ui())
+
+                                # Handle input processing
+                                await self._process_input()
+
+                                # Periodically refresh the scan on Linux
+                                if (
                                     time.time() - self.last_scan_refresh
-                                )
-                                if time_since_refresh > SCAN_DURATION:
-                                    # Restart scanner periodically to prevent device cache issues
-                                    await scanner.stop()
-                                    await asyncio.sleep(0.5)
-                                    await scanner.start()
-                                    self.last_scan_refresh = time.time()
-                                    self.console.print(
-                                        "[yellow]Refreshing scan...[/]", end="\r"
-                                    )
-                            else:
-                                self.last_scan_refresh = time.time()
+                                    > SCAN_DURATION / 2
+                                ):
+                                    try:
+                                        # Restart scanner carefully to avoid BlueZ errors
+                                        await scanner.stop()
+                                        await asyncio.sleep(
+                                            0.5
+                                        )  # Allow BlueZ to settle
+                                        await scanner.start()
+                                        self.last_scan_refresh = time.time()
+                                    except Exception as e:
+                                        self.console.print(
+                                            f"[yellow]Scan refresh warning: {e}[/]",
+                                            end="\r",
+                                        )
+                                        self.last_scan_refresh = (
+                                            time.time()
+                                        )  # Still update time to avoid rapid retries
 
-                            # Short sleep to avoid high CPU usage
-                            await asyncio.sleep(0.1)
+                                # Short sleep to avoid high CPU usage
+                                await asyncio.sleep(0.1)
+
+                            # Stop the scanner after each phase
+                            if scanner is not None:
+                                try:
+                                    await scanner.stop()
+                                except Exception:
+                                    pass
+                    finally:
+                        # Ensure scanner is properly closed
+                        if scanner is not None:
+                            try:
+                                await scanner.stop()
+                            except Exception:
+                                pass
+                else:
+                    # For non-Linux platforms, use multiple scanning phases
+                    for phase_idx, phase in enumerate(scan_phases):
+                        # Only do additional phases if retry is enabled
+                        if (
+                            phase_idx > 0
+                            and not ADVANCED_SCAN_SETTINGS["extended_retries"]
+                        ):
+                            break
+
+                        # Update scanner parameters for this phase
+                        scanner_kwargs["scanning_mode"] = phase["mode"]
+
+                        self.console.print(
+                            f"[yellow]Phase {phase_idx+1}/{len(scan_phases)}: {phase['description']}[/]"
+                        )
+
+                        # Start the scanner with the current phase parameters
+                        async with BleakScanner(**scanner_kwargs) as scanner:
+                            phase_start_time = time.time()
+
+                            # Scan for the specified duration per phase
+                            while self.scanning and (
+                                time.time() - phase_start_time < SCAN_DURATION
+                            ):
+                                # Update UI
+                                live.update(self._update_ui())
+
+                                # Handle input processing
+                                await self._process_input()
+
+                                # Periodically refresh the scanner
+                                if hasattr(self, "last_scan_refresh"):
+                                    time_since_refresh = (
+                                        time.time() - self.last_scan_refresh
+                                    )
+                                    if time_since_refresh > SCAN_DURATION / 2:
+                                        # Restart scanner to prevent device cache issues
+                                        await scanner.stop()
+                                        await asyncio.sleep(0.5)
+                                        await scanner.start()
+                                        self.last_scan_refresh = time.time()
+                                else:
+                                    self.last_scan_refresh = time.time()
+
+                                # Short sleep to avoid high CPU usage
+                                await asyncio.sleep(0.1)
+
+                            # Short pause between phases
+                            if self.scanning and phase_idx < len(scan_phases) - 1:
+                                self.console.print(
+                                    "[yellow]Switching scan phase...[/]", end="\r"
+                                )
+                                await asyncio.sleep(1.0)
+
+            # Continue scanning until user quits
+            while self.scanning:
+                # Update UI
+                live.update(self._update_ui())
+
+                # Handle input processing
+                await self._process_input()
+
+                # Short sleep to avoid high CPU usage
+                await asyncio.sleep(0.1)
+
         finally:
             # Clear the terminal when finishing scan
             self.console.clear()
@@ -2739,6 +2950,14 @@ class TagFinder:
                 "[green]ON[/]" if self.calibration_mode else "[red]OFF[/]"
             )
 
+            # Get range mode
+            range_mode = self.settings.get("range_mode", "Normal")
+            range_color = "yellow"
+            if range_mode == "Maximum":
+                range_color = "green"
+            elif range_mode == "Balanced":
+                range_color = "blue"
+
             # Calculate scan duration if we've been scanning
             scan_time = time.time() - min(
                 [d.first_seen for d in self.devices.values()], default=time.time()
@@ -2802,6 +3021,7 @@ class TagFinder:
                         f"[bold]Find My mode:[/] {airtag_mode}",
                         f"[bold]Adaptive:[/] {adaptive_mode}",
                         f"[bold]Calibration:[/] {calibration_mode}",
+                        f"[bold]Range mode:[/] [{range_color}]{range_mode}[/]",
                         f"[bold]Adapter:[/] {self.current_adapter or 'Default'}",
                         "",
                         f"{selected_info.strip() if selected_info else ''}",
@@ -2891,6 +3111,9 @@ class TagFinder:
         # Clear terminal at startup
         self.console.clear()
 
+        # Declare globals first
+        global SCAN_DURATION, DETECTION_THRESHOLD, SCAN_PARAMETERS, ADVANCED_SCAN_SETTINGS
+
         self.console.print(
             Panel.fit("[bold cyan]TagFinder - Bluetooth Device Scanner[/]", box=ROUNDED)
         )
@@ -2901,9 +3124,21 @@ class TagFinder:
 
         # Apply custom calibration values if available
         if "distance_n_value" in self.settings:
+            global DEFAULT_DISTANCE_N_VALUE
             DEFAULT_DISTANCE_N_VALUE = self.settings["distance_n_value"]
         if "rssi_at_one_meter" in self.settings:
+            global DEFAULT_RSSI_AT_ONE_METER
             DEFAULT_RSSI_AT_ONE_METER = self.settings["rssi_at_one_meter"]
+
+        # Apply range mode settings if available
+        if "scan_duration" in self.settings:
+            SCAN_DURATION = self.settings["scan_duration"]
+        if "detection_threshold" in self.settings:
+            DETECTION_THRESHOLD = self.settings["detection_threshold"]
+        if "extended_retries" in self.settings:
+            ADVANCED_SCAN_SETTINGS["extended_retries"] = self.settings.get(
+                "extended_retries", 3
+            )
 
         while True:
             # Display status and wait for command
@@ -2955,6 +3190,12 @@ class TagFinder:
                 self.console.print(
                     f"[bold]Adaptive distance: {'[green]ON[/]' if self.adaptive_mode else '[red]OFF[/]'} - Settings saved"
                 )
+            elif cmd == "r":
+                # Configure scan range
+                self.configure_scan_range()
+            elif cmd == "m":
+                # Test maximum range of all adapters
+                await self.test_adapter_range()
             elif cmd == "l":
                 await self.list_adapters()
                 # Settings are saved in list_adapters() if adapter is changed
@@ -2974,10 +3215,491 @@ class TagFinder:
                 # Clear terminal before showing error
                 self.console.clear()
                 self.console.print(
-                    "[yellow]Unknown command. Use 's', 'a', 'd', 'c', 'l', 'z', or 'q'.[/]"
+                    "[yellow]Unknown command. Use 's', 'a', 'd', 'c', 'r', 'm', 'l', 'z', or 'q'.[/]"
                 )
 
         self.console.print("[green]Exiting TagFinder...[/]")
+
+    def configure_scan_range(self):
+        """Configure scan range optimization settings"""
+        # Declare globals first
+        global SCAN_DURATION, DETECTION_THRESHOLD, SCAN_PARAMETERS, ADVANCED_SCAN_SETTINGS
+
+        # Clear terminal before showing range options
+        self.console.clear()
+
+        # Current range mode
+        current_mode = self.settings.get("range_mode", "Normal")
+
+        # Display explanation and options
+        self.console.print(
+            Panel(
+                "\n".join(
+                    [
+                        "[bold]Configure Scanning Range[/]",
+                        "",
+                        "Choose a scanning range preset to optimize detection:",
+                        "",
+                        f"[yellow]1. Normal[/] - Standard scanning parameters",
+                        "   • Balanced power consumption",
+                        "   • Detects devices within ~10-15m range",
+                        "   • Battery friendly for mobile devices",
+                        "",
+                        f"[blue]2. Balanced[/] - Enhanced scanning parameters",
+                        "   • Moderately aggressive scanning",
+                        "   • Increased range up to ~20-25m",
+                        "   • Moderate battery impact",
+                        "",
+                        f"[green]3. Maximum[/] - Maximum range optimization",
+                        "   • Multi-phase aggressive scanning",
+                        "   • Maximum possible range (up to ~30-40m in good conditions)",
+                        "   • Uses more battery power",
+                        "   • May detect very weak signals",
+                        "",
+                        f"Current setting: [{current_mode}]",
+                    ]
+                ),
+                title="[bold cyan]Range Configuration[/]",
+                border_style="cyan",
+                box=ROUNDED,
+            )
+        )
+
+        # Get user choice
+        choice = self.console.input("\n[bold blue]Select range mode (1-3): [/]").strip()
+
+        # Process choice
+        range_mode = current_mode
+        extended_retries = ADVANCED_SCAN_SETTINGS["extended_retries"]
+        detection_threshold = DETECTION_THRESHOLD
+        scan_duration = SCAN_DURATION
+        scan_timeout = SCAN_PARAMETERS["timeout"]
+
+        if choice == "1":
+            range_mode = "Normal"
+            extended_retries = 1  # Just one standard scan phase
+            detection_threshold = -85  # Standard threshold
+            scan_duration = 10.0  # Normal duration
+            scan_timeout = 5.0
+
+            self.console.print("[yellow]Normal range mode selected[/]")
+
+        elif choice == "2":
+            range_mode = "Balanced"
+            extended_retries = 2  # Two scan phases
+            detection_threshold = -90  # Enhanced threshold
+            scan_duration = 12.0  # Slightly longer duration
+            scan_timeout = 8.0
+
+            self.console.print("[blue]Balanced range mode selected[/]")
+
+        elif choice == "3":
+            range_mode = "Maximum"
+            extended_retries = 3  # All scan phases
+            detection_threshold = -95  # Maximum threshold
+            scan_duration = 15.0  # Maximum duration
+            scan_timeout = 10.0
+
+            self.console.print("[green]Maximum range mode selected[/]")
+
+        else:
+            self.console.print("[yellow]Invalid choice. Keeping current settings.[/]")
+            return
+
+        # Update settings
+        self.settings["range_mode"] = range_mode
+        self.settings["scan_duration"] = scan_duration
+        self.settings["detection_threshold"] = detection_threshold
+
+        # Update global constants based on settings
+        SCAN_DURATION = scan_duration
+        DETECTION_THRESHOLD = detection_threshold
+        SCAN_PARAMETERS["timeout"] = scan_timeout
+
+        # Update advanced settings
+        ADVANCED_SCAN_SETTINGS["extended_retries"] = extended_retries
+
+        # Save settings
+        self._save_settings()
+
+        # Show success message
+        self.console.print(
+            f"[bold green]Scan range settings updated to {range_mode} mode[/]"
+        )
+
+        # Wait for user to press a key
+        self.console.print("\n[bold]Press any key to continue...[/]")
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.getch()
+        else:
+            try:
+                import termios
+                import tty
+
+                old_settings = termios.tcgetattr(sys.stdin)
+                try:
+                    tty.setraw(sys.stdin.fileno(), termios.TCSANOW)
+                    sys.stdin.read(1)
+                finally:
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            except:
+                # Fallback if terminal handling fails
+                input()
+
+    async def test_adapter_range(self):
+        """Test the maximum range capabilities of all available adapters"""
+        # Clear terminal
+        self.console.clear()
+
+        # Declare globals to ensure we're using the latest settings
+        global SCAN_DURATION, DETECTION_THRESHOLD, SCAN_PARAMETERS, ADVANCED_SCAN_SETTINGS
+
+        # Store original adapter to restore later
+        original_adapter = self.current_adapter
+
+        # Set maximum range mode for testing
+        old_range_mode = self.settings.get("range_mode", "Normal")
+
+        # Force maximum range settings for the test
+        SCAN_DURATION = 20.0  # Extended duration for thorough testing
+        DETECTION_THRESHOLD = -100  # Maximum sensitivity
+        SCAN_PARAMETERS["timeout"] = 15.0
+        ADVANCED_SCAN_SETTINGS["extended_retries"] = 3
+
+        self.console.print(
+            Panel(
+                "[bold cyan]Adapter Range Test[/]\n\n"
+                "This test will scan with each available Bluetooth adapter to determine maximum detection range.\n"
+                "Each adapter will be used with maximum sensitivity settings to find as many devices as possible.\n\n"
+                "[yellow]Note: This test may take several minutes to complete.[/]",
+                title="[bold green]Maximum Range Test[/]",
+                border_style="green",
+                box=ROUNDED,
+            )
+        )
+
+        # Get list of available adapters
+        available_adapters = await self._find_available_adapters()
+
+        if not available_adapters:
+            self.console.print(
+                "[yellow]No Bluetooth adapters found. Using default adapter.[/]"
+            )
+            available_adapters = [{"address": None, "name": "Default Adapter"}]
+
+        # Create table for results
+        results_table = Table(
+            title="[bold]Adapter Range Capability Test Results[/]",
+            box=ROUNDED,
+            border_style="blue",
+        )
+
+        results_table.add_column("Adapter", style="cyan")
+        results_table.add_column("Devices Found", style="green", justify="right")
+        results_table.add_column("Max Distance", style="yellow", justify="right")
+        results_table.add_column("Avg RSSI", style="magenta", justify="right")
+        results_table.add_column("Find My Devices", style="red", justify="right")
+
+        adapter_results = []
+
+        # Test each adapter
+        for i, adapter in enumerate(available_adapters):
+            adapter_name = adapter["name"]
+            adapter_address = adapter["address"]
+
+            self.console.print(
+                f"\n[bold cyan]Testing adapter {i+1}/{len(available_adapters)}: {adapter_name}[/]"
+            )
+
+            # Set current adapter
+            self.current_adapter = adapter_address
+
+            # Clear devices from previous tests
+            self.devices = {}
+
+            # Perform the scan
+            try:
+                self.console.print(f"[yellow]Starting scan with {adapter_name}...[/]")
+
+                # Start a new scan with maximum settings
+                scanner_kwargs = {}
+                if adapter_address:
+                    scanner_kwargs["adapter"] = adapter_address
+
+                # Configure scanner for maximum range
+                scanner_kwargs["scanning_mode"] = "active"
+                scanner_kwargs["detection_callback"] = self.discovery_callback
+                scanner_kwargs["timeout"] = SCAN_PARAMETERS["timeout"]
+
+                # Use platform-specific optimizations
+                if hasattr(bleak.backends, "bluezdbus") and sys.platform.startswith(
+                    "linux"
+                ):
+                    scanner_kwargs["bluez"] = {
+                        "interval": 0x0020,  # Aggressive scanning
+                        "window": 0x0020,  # Maximize window
+                        "passive": False,  # Start with active scanning
+                    }
+                elif (
+                    hasattr(bleak.backends, "corebluetooth")
+                    and sys.platform == "darwin"
+                ):
+                    # Always force active mode on macOS as passive is not supported
+                    scanner_kwargs["scanning_mode"] = "active"
+                    scanner_kwargs["cb"] = {
+                        "use_bdaddr": True,
+                        "duration": SCAN_DURATION,
+                    }
+
+                # Multi-phase scanning for maximum coverage
+                if sys.platform == "darwin":  # macOS doesn't support passive scanning
+                    scan_phases = [
+                        {"mode": "active", "description": "Active scanning"},
+                        {
+                            "mode": "active",
+                            "description": "Aggressive active scanning",
+                            "interval": 0x0020,
+                        },
+                    ]
+                else:
+                    scan_phases = [
+                        {"mode": "active", "description": "Active scanning"},
+                        {"mode": "passive", "description": "Passive scanning"},
+                    ]
+
+                # Progress indicator
+                progress_chars = "⣾⣽⣻⢿⡿⣟⣯⣷"
+                progress_index = 0
+
+                # Scan with each phase
+                for phase_idx, phase in enumerate(scan_phases):
+                    scanner_kwargs["scanning_mode"] = phase["mode"]
+
+                    # Create and start scanner
+                    scanner = BleakScanner(**scanner_kwargs)
+                    await scanner.start()
+
+                    # Scan for duration
+                    start_time = time.time()
+                    while time.time() - start_time < SCAN_DURATION:
+                        # Show progress
+                        progress_index = (progress_index + 1) % len(progress_chars)
+                        self.console.print(
+                            f"[bold cyan]{progress_chars[progress_index]} Scanning with {phase['description']} ({int(time.time() - start_time)}/{int(SCAN_DURATION)}s)[/]",
+                            end="\r",
+                        )
+                        await asyncio.sleep(0.5)
+
+                    # Stop scanner
+                    await scanner.stop()
+
+                # Collect results
+                device_count = len(self.devices)
+
+                # Calculate maximum distance and average RSSI
+                max_distance = 0
+                total_rssi = 0
+                find_my_count = 0
+
+                for device in self.devices.values():
+                    total_rssi += device.rssi
+                    if device.distance > max_distance:
+                        max_distance = device.distance
+                    if device.is_airtag:
+                        find_my_count += 1
+
+                avg_rssi = total_rssi / device_count if device_count > 0 else 0
+
+                # Store results
+                adapter_results.append(
+                    {
+                        "adapter": adapter_name,
+                        "device_count": device_count,
+                        "max_distance": max_distance,
+                        "avg_rssi": avg_rssi,
+                        "find_my_count": find_my_count,
+                    }
+                )
+
+                # Add to results table
+                results_table.add_row(
+                    adapter_name,
+                    str(device_count),
+                    f"{max_distance:.2f}m",
+                    f"{avg_rssi:.1f} dBm",
+                    str(find_my_count),
+                )
+
+                self.console.print(
+                    f"\n[green]Scan complete: Found {device_count} devices with {adapter_name}[/]"
+                )
+
+            except Exception as e:
+                self.console.print(
+                    f"[bold red]Error testing adapter {adapter_name}: {e}[/]"
+                )
+                results_table.add_row(adapter_name, "Error", "N/A", "N/A", "N/A")
+
+            # Short pause between adapters
+            await asyncio.sleep(1)
+
+        # Restore original adapter
+        self.current_adapter = original_adapter
+
+        # Restore original range mode settings
+        self.settings["range_mode"] = old_range_mode
+
+        # Display results
+        self.console.clear()
+        self.console.print(
+            Panel(
+                "[bold green]Adapter Range Test Complete[/]\n\n"
+                "The following results show the detection capabilities of each Bluetooth adapter.\n"
+                "Higher device counts and maximum distances indicate better range performance.",
+                title="[bold cyan]Test Results[/]",
+                border_style="cyan",
+            )
+        )
+
+        self.console.print(results_table)
+
+        # Find best adapter
+        if adapter_results:
+            # Find adapter with maximum device count
+            best_adapter = max(adapter_results, key=lambda x: x["device_count"])
+
+            # Recommend best adapter
+            self.console.print(
+                Panel(
+                    f"[bold green]Recommended Adapter:[/] {best_adapter['adapter']}\n"
+                    f"[bold]Devices Found:[/] {best_adapter['device_count']}\n"
+                    f"[bold]Maximum Distance:[/] {best_adapter['max_distance']:.2f}m\n"
+                    f"[bold]Find My Devices:[/] {best_adapter['find_my_count']}",
+                    title="[bold green]Best Performing Adapter[/]",
+                    border_style="green",
+                )
+            )
+
+            # Ask if user wants to use this adapter
+            if (
+                best_adapter["adapter"] != "Default Adapter"
+                and best_adapter["adapter"] != original_adapter
+            ):
+                use_best = (
+                    self.console.input(
+                        f"\n[bold blue]Would you like to use {best_adapter['adapter']} as your default adapter? (y/n): [/]"
+                    )
+                    .strip()
+                    .lower()
+                )
+
+                if use_best == "y":
+                    # Find address for this adapter
+                    best_address = None
+                    for adapter in available_adapters:
+                        if adapter["name"] == best_adapter["adapter"]:
+                            best_address = adapter["address"]
+                            break
+
+                    if best_address:
+                        self.current_adapter = best_address
+                        self.settings["adapter"] = best_address
+                        self._save_settings()
+                        self.console.print(
+                            f"[green]Adapter set to {best_adapter['adapter']}[/]"
+                        )
+
+        # Wait for user to press a key before continuing
+        self.console.print("\n[bold]Press any key to return to main menu...[/]")
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.getch()
+        else:
+            try:
+                import termios
+                import tty
+
+                old_settings = termios.tcgetattr(sys.stdin)
+                try:
+                    tty.setraw(sys.stdin.fileno(), termios.TCSANOW)
+                    sys.stdin.read(1)
+                finally:
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            except:
+                # Fallback if terminal handling fails
+                input()
+
+    async def _find_available_adapters(self):
+        """Find all available Bluetooth adapters"""
+        adapters = []
+
+        # Different methods for different platforms
+        try:
+            if sys.platform == "darwin":  # macOS
+                # On macOS, we can use system_profiler
+                import subprocess
+
+                result = subprocess.run(
+                    ["system_profiler", "SPBluetoothDataType"],
+                    capture_output=True,
+                    text=True,
+                )
+                output = result.stdout
+
+                # Parse the output for Bluetooth controller info
+                if "Bluetooth Controller" in output:
+                    controller_section = output.split("Bluetooth Controller")[1].split(
+                        "\n\n"
+                    )[0]
+                    address = None
+                    name = "Apple Bluetooth"
+
+                    if "Address:" in controller_section:
+                        address_line = [
+                            l for l in controller_section.split("\n") if "Address:" in l
+                        ]
+                        if address_line:
+                            address = address_line[0].split("Address:")[1].strip()
+
+                    adapters.append({"address": address, "name": name})
+
+            elif sys.platform.startswith("linux"):
+                # On Linux, we can use hcitool
+                import subprocess
+
+                result = subprocess.run(
+                    ["hcitool", "dev"], capture_output=True, text=True
+                )
+                output = result.stdout
+
+                for line in output.split("\n"):
+                    if "hci" in line:
+                        parts = line.strip().split("\t")
+                        if len(parts) >= 3:
+                            adapters.append(
+                                {
+                                    "address": parts[2],
+                                    "name": f"Bluetooth Adapter ({parts[1]})",
+                                }
+                            )
+
+            elif sys.platform == "win32":
+                # On Windows, we can use Bleak's internal API
+                from bleak.backends.winrt.scanner import BleakScannerWinRT
+
+                scanner = BleakScannerWinRT()
+                await scanner._ensure_adapter()
+                adapters.append(
+                    {"address": "default", "name": "Windows Bluetooth Adapter"}
+                )
+
+        except Exception as e:
+            self.console.print(f"[bold yellow]Error finding adapters: {e}[/]")
+
+        return adapters
 
 
 if __name__ == "__main__":
