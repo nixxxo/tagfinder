@@ -2941,189 +2941,354 @@ class TagFinder:
             # Implement multi-phase scanning for maximum range
             retry_count = ADVANCED_SCAN_SETTINGS["extended_retries"]
 
-            # Create different scanning phases with different parameters
+            # Determine range mode for proper scanning intensity
+            range_mode = self.settings.get("range_mode", "Normal")
+
+            # Create different scanning phases with different parameters based on range mode
             if sys.platform == "darwin":  # macOS doesn't support passive scanning
-                scan_phases = [
-                    {"mode": "active", "description": "Active scanning (standard)"},
-                    {
-                        "mode": "active",
-                        "interval": 0x0020,
-                        "description": "Aggressive active scanning",
-                    },
-                ]
+                if range_mode == "Maximum":
+                    # Ultra-aggressive scanning for Maximum mode on macOS
+                    scan_phases = [
+                        {"mode": "active", "description": "Active scanning (standard)"},
+                        {
+                            "mode": "active",
+                            "interval": 0x0010,  # Ultra-aggressive interval
+                            "description": "Aggressive active scanning",
+                        },
+                        {
+                            "mode": "active",
+                            "interval": 0x0020,
+                            "window": 0x0020,  # Full duty cycle
+                            "description": "Maximum power active scanning",
+                        },
+                    ]
+                else:
+                    scan_phases = [
+                        {"mode": "active", "description": "Active scanning (standard)"},
+                        {
+                            "mode": "active",
+                            "interval": 0x0020,
+                            "description": "Aggressive active scanning",
+                        },
+                    ]
             else:
-                scan_phases = [
-                    {"mode": "active", "description": "Active scanning (standard)"},
-                    {
-                        "mode": "passive",
-                        "description": "Passive scanning (longer range)",
-                        "passive": True,  # Critical for passive scanning on Linux
-                    },
-                    {
-                        "mode": "active",
-                        "interval": 0x0020,
-                        "description": "Aggressive active scanning",
-                    },
-                ]
+                if range_mode == "Maximum":
+                    # Ultra-aggressive scanning for Maximum mode on Linux
+                    scan_phases = [
+                        {"mode": "active", "description": "Active scanning (standard)"},
+                        {
+                            "mode": "passive",
+                            "description": "Passive scanning (longer range)",
+                            "passive": True,  # Critical for passive scanning on Linux
+                        },
+                        {
+                            "mode": "active",
+                            "interval": 0x0010,  # Ultra-aggressive interval
+                            "window": 0x0010,  # Maximum window size
+                            "description": "Ultra-aggressive active scanning",
+                        },
+                        {
+                            "mode": "active",
+                            "interval": 0x0020,
+                            "window": 0x0020,  # Full duty cycle for maximum power
+                            "description": "Maximum power active scanning",
+                        },
+                    ]
+                else:
+                    scan_phases = [
+                        {"mode": "active", "description": "Active scanning (standard)"},
+                        {
+                            "mode": "passive",
+                            "description": "Passive scanning (longer range)",
+                            "passive": True,  # Critical for passive scanning on Linux
+                        },
+                        {
+                            "mode": "active",
+                            "interval": 0x0020,
+                            "description": "Aggressive active scanning",
+                        },
+                    ]
 
             # Use Rich Live display for UI updates during all scanning phases
             with Live(self._update_ui(), refresh_per_second=4) as live:
-                # First handle Linux BlueZ backend specifically to avoid InProgress errors
-                if sys.platform.startswith("linux"):
-                    scanner = None
+                # Main scan loop that continues indefinitely until user quits
+                scan_start_time = time.time()
+
+                # Keep track of scan cycles to prevent getting stuck
+                scan_cycles = 0
+                max_phase_duration = SCAN_DURATION * 1.5  # Add extra time for safety
+
+                # Set watchdog timer to prevent scans from getting stuck
+                watchdog_timer = time.time()
+
+                while self.scanning:
                     try:
-                        # Perform multi-phase scanning on Linux
-                        for phase_idx, phase in enumerate(scan_phases):
-                            # Only do additional phases if retry is enabled
-                            if (
-                                phase_idx > 0
-                                and not ADVANCED_SCAN_SETTINGS["extended_retries"]
-                            ):
-                                break
+                        # First handle Linux BlueZ backend specifically to avoid InProgress errors
+                        if sys.platform.startswith("linux"):
+                            scanner = None
+                            try:
+                                # Perform multi-phase scanning on Linux
+                                for phase_idx, phase in enumerate(scan_phases):
+                                    # If user stopped scanning, exit
+                                    if not self.scanning:
+                                        break
 
-                            # Update scanner parameters for this phase
-                            scanner_kwargs["scanning_mode"] = phase["mode"]
+                                    # Skip phases if user requested to quit
+                                    if not self.scanning:
+                                        break
 
-                            # Update Linux-specific bluez parameters when mode changes
-                            if "bluez" in scanner_kwargs:
-                                # Handle passive scanning mode for Linux
-                                if "passive" in phase and phase["mode"] == "passive":
-                                    scanner_kwargs["bluez"]["passive"] = True
-                                    # Add required or_patterns for passive scanning
-                                    scanner_kwargs["bluez"]["or_patterns"] = or_patterns
-                                else:
-                                    scanner_kwargs["bluez"]["passive"] = False
+                                    # Reset watchdog timer for each phase
+                                    watchdog_timer = time.time()
 
-                                # Update interval if specified
-                                if "interval" in phase:
-                                    scanner_kwargs["bluez"]["interval"] = phase[
-                                        "interval"
-                                    ]
+                                    # Update scanner parameters for this phase
+                                    scanner_kwargs["scanning_mode"] = phase["mode"]
 
-                            self.console.print(
-                                f"[yellow]Phase {phase_idx+1}/{len(scan_phases)}: {phase['description']}[/]"
-                            )
+                                    # Update Linux-specific bluez parameters when mode changes
+                                    if "bluez" in scanner_kwargs:
+                                        # Handle passive scanning mode for Linux
+                                        if (
+                                            "passive" in phase
+                                            and phase["mode"] == "passive"
+                                        ):
+                                            scanner_kwargs["bluez"]["passive"] = True
+                                            # Add required or_patterns for passive scanning
+                                            scanner_kwargs["bluez"][
+                                                "or_patterns"
+                                            ] = or_patterns
+                                        else:
+                                            scanner_kwargs["bluez"]["passive"] = False
 
-                            # Create scanner without starting it yet
-                            scanner = BleakScanner(**scanner_kwargs)
-                            # Start scanning explicitly
-                            await scanner.start()
-                            self.last_scan_refresh = time.time()
-                            phase_start_time = time.time()
+                                        # Update interval if specified
+                                        if "interval" in phase:
+                                            scanner_kwargs["bluez"]["interval"] = phase[
+                                                "interval"
+                                            ]
 
-                            # Scan for specified duration
-                            while self.scanning and (
-                                time.time() - phase_start_time < SCAN_DURATION
-                            ):
-                                # Update UI
-                                live.update(self._update_ui())
+                                        # Update window if specified (for aggressive scanning)
+                                        if "window" in phase:
+                                            scanner_kwargs["bluez"]["window"] = phase[
+                                                "window"
+                                            ]
 
-                                # Handle input processing
-                                await self._process_input()
+                                    self.console.print(
+                                        f"[yellow]Phase {phase_idx+1}/{len(scan_phases)}: {phase['description']}[/]"
+                                    )
 
-                                # Periodically refresh the scan on Linux
-                                if (
-                                    time.time() - self.last_scan_refresh
-                                    > SCAN_DURATION / 2
-                                ):
+                                    # Create scanner without starting it yet
                                     try:
-                                        # Restart scanner carefully to avoid BlueZ errors
-                                        await scanner.stop()
-                                        await asyncio.sleep(
-                                            0.5
-                                        )  # Allow BlueZ to settle
+                                        scanner = BleakScanner(**scanner_kwargs)
+                                        # Start scanning explicitly
                                         await scanner.start()
                                         self.last_scan_refresh = time.time()
+                                        phase_start_time = time.time()
                                     except Exception as e:
                                         self.console.print(
-                                            f"[yellow]Scan refresh warning: {e}[/]",
-                                            end="\r",
+                                            f"[yellow]Warning: Scanner initialization error: {e}. Trying next phase.[/]"
                                         )
-                                        self.last_scan_refresh = (
-                                            time.time()
-                                        )  # Still update time to avoid rapid retries
+                                        await asyncio.sleep(1.0)
+                                        continue
 
-                                # Short sleep to avoid high CPU usage
-                                await asyncio.sleep(0.1)
+                                    # Scan for specified duration with watchdog
+                                    scan_running = True
+                                    while (
+                                        self.scanning
+                                        and scan_running
+                                        and (
+                                            time.time() - phase_start_time
+                                            < max_phase_duration
+                                        )
+                                    ):
+                                        # Update UI
+                                        live.update(self._update_ui())
 
-                            # Stop the scanner after each phase
-                            if scanner is not None:
-                                try:
-                                    await scanner.stop()
-                                except Exception:
-                                    pass
-                    finally:
-                        # Ensure scanner is properly closed
-                        if scanner is not None:
-                            try:
-                                await scanner.stop()
-                            except Exception:
-                                pass
-                else:
-                    # For non-Linux platforms, use multiple scanning phases
-                    for phase_idx, phase in enumerate(scan_phases):
-                        # Only do additional phases if retry is enabled
-                        if (
-                            phase_idx > 0
-                            and not ADVANCED_SCAN_SETTINGS["extended_retries"]
-                        ):
-                            break
+                                        # Handle input processing
+                                        await self._process_input()
 
-                        # Update scanner parameters for this phase
-                        scanner_kwargs["scanning_mode"] = phase["mode"]
+                                        # Periodically refresh the scan on Linux
+                                        if (
+                                            time.time() - self.last_scan_refresh
+                                            > SCAN_DURATION / 3
+                                        ):
+                                            try:
+                                                # Restart scanner carefully to avoid BlueZ errors
+                                                await scanner.stop()
+                                                await asyncio.sleep(
+                                                    0.3
+                                                )  # Allow BlueZ to settle
+                                                await scanner.start()
+                                                self.last_scan_refresh = time.time()
+                                            except Exception as e:
+                                                self.console.print(
+                                                    f"[yellow]Scan refresh warning: {e}. Continuing.[/]",
+                                                    end="\r",
+                                                )
+                                                self.last_scan_refresh = time.time()
+                                                # If scanner error, break this phase
+                                                if (
+                                                    "not found" in str(e).lower()
+                                                    or "error" in str(e).lower()
+                                                ):
+                                                    scan_running = False
 
-                        self.console.print(
-                            f"[yellow]Phase {phase_idx+1}/{len(scan_phases)}: {phase['description']}[/]"
-                        )
+                                        # Watchdog - check if we're stuck in this phase for too long
+                                        if (
+                                            time.time() - watchdog_timer
+                                            > max_phase_duration * 1.5
+                                        ):
+                                            self.console.print(
+                                                f"[yellow]Warning: Scan phase taking too long. Moving to next phase.[/]"
+                                            )
+                                            scan_running = False
 
-                        # Start the scanner with the current phase parameters
-                        async with BleakScanner(**scanner_kwargs) as scanner:
-                            phase_start_time = time.time()
+                                        # Short sleep to avoid high CPU usage
+                                        await asyncio.sleep(0.1)
 
-                            # Scan for the specified duration per phase
-                            while self.scanning and (
-                                time.time() - phase_start_time < SCAN_DURATION
-                            ):
-                                # Update UI
-                                live.update(self._update_ui())
-
-                                # Handle input processing
-                                await self._process_input()
-
-                                # Periodically refresh the scanner
-                                if hasattr(self, "last_scan_refresh"):
-                                    time_since_refresh = (
-                                        time.time() - self.last_scan_refresh
-                                    )
-                                    if time_since_refresh > SCAN_DURATION / 2:
-                                        # Restart scanner to prevent device cache issues
+                                    # Stop the scanner after each phase
+                                    if scanner is not None:
+                                        try:
+                                            await scanner.stop()
+                                        except Exception:
+                                            pass
+                            finally:
+                                # Ensure scanner is properly closed
+                                if scanner is not None:
+                                    try:
                                         await scanner.stop()
-                                        await asyncio.sleep(0.5)
-                                        await scanner.start()
-                                        self.last_scan_refresh = time.time()
-                                else:
-                                    self.last_scan_refresh = time.time()
+                                    except Exception:
+                                        pass
+                        else:
+                            # For non-Linux platforms, use multiple scanning phases
+                            for phase_idx, phase in enumerate(scan_phases):
+                                # If user stopped scanning, exit
+                                if not self.scanning:
+                                    break
 
-                                # Short sleep to avoid high CPU usage
-                                await asyncio.sleep(0.1)
+                                # Reset watchdog timer for each phase
+                                watchdog_timer = time.time()
 
-                            # Short pause between phases
-                            if self.scanning and phase_idx < len(scan_phases) - 1:
+                                # Update scanner parameters for this phase
+                                scanner_kwargs["scanning_mode"] = phase["mode"]
+
+                                # Update interval/window parameters if specified
+                                if "cb" in scanner_kwargs:
+                                    if "interval" in phase:
+                                        scanner_kwargs["cb"]["interval"] = phase[
+                                            "interval"
+                                        ]
+                                    if "window" in phase:
+                                        scanner_kwargs["cb"]["window"] = phase["window"]
+
                                 self.console.print(
-                                    "[yellow]Switching scan phase...[/]", end="\r"
+                                    f"[yellow]Phase {phase_idx+1}/{len(scan_phases)}: {phase['description']}[/]"
                                 )
-                                await asyncio.sleep(1.0)
 
-            # Continue scanning until user quits
-            while self.scanning:
-                # Update UI
-                live.update(self._update_ui())
+                                # Start the scanner with the current phase parameters
+                                try:
+                                    async with BleakScanner(
+                                        **scanner_kwargs
+                                    ) as scanner:
+                                        phase_start_time = time.time()
 
-                # Handle input processing
-                await self._process_input()
+                                        # Scan for the specified duration with watchdog
+                                        scan_running = True
+                                        while (
+                                            self.scanning
+                                            and scan_running
+                                            and (
+                                                time.time() - phase_start_time
+                                                < max_phase_duration
+                                            )
+                                        ):
+                                            # Update UI
+                                            live.update(self._update_ui())
 
-                # Short sleep to avoid high CPU usage
-                await asyncio.sleep(0.1)
+                                            # Handle input processing
+                                            await self._process_input()
+
+                                            # Periodically refresh the scanner
+                                            if hasattr(self, "last_scan_refresh"):
+                                                time_since_refresh = (
+                                                    time.time() - self.last_scan_refresh
+                                                )
+                                                if (
+                                                    time_since_refresh
+                                                    > SCAN_DURATION / 3
+                                                ):
+                                                    try:
+                                                        # Restart scanner to prevent device cache issues
+                                                        await scanner.stop()
+                                                        await asyncio.sleep(0.3)
+                                                        await scanner.start()
+                                                        self.last_scan_refresh = (
+                                                            time.time()
+                                                        )
+                                                    except Exception as e:
+                                                        self.console.print(
+                                                            f"[yellow]Scan refresh warning: {e}. Continuing.[/]",
+                                                            end="\r",
+                                                        )
+                                                        self.last_scan_refresh = (
+                                                            time.time()
+                                                        )
+                                                        # If scanner error, break this phase
+                                                        if (
+                                                            "not found"
+                                                            in str(e).lower()
+                                                            or "error" in str(e).lower()
+                                                        ):
+                                                            scan_running = False
+                                            else:
+                                                self.last_scan_refresh = time.time()
+
+                                            # Watchdog - check if we're stuck
+                                            if (
+                                                time.time() - watchdog_timer
+                                                > max_phase_duration * 1.5
+                                            ):
+                                                self.console.print(
+                                                    f"[yellow]Warning: Scan phase taking too long. Moving to next phase.[/]"
+                                                )
+                                                scan_running = False
+
+                                            # Short sleep to avoid high CPU usage
+                                            await asyncio.sleep(0.1)
+                                except Exception as e:
+                                    self.console.print(
+                                        f"[yellow]Warning: Scanner error in phase {phase_idx+1}: {e}. Continuing to next phase.[/]"
+                                    )
+                                    await asyncio.sleep(1.0)
+                                    continue
+
+                                # Short pause between phases
+                                if self.scanning and phase_idx < len(scan_phases) - 1:
+                                    self.console.print(
+                                        "[yellow]Switching scan phase...[/]", end="\r"
+                                    )
+                                    await asyncio.sleep(0.5)
+
+                        # Increment scan cycles count
+                        scan_cycles += 1
+
+                        # Short pause between full scan cycles
+                        if self.scanning:
+                            self.console.print(
+                                f"[green]Scan cycle {scan_cycles} complete. Starting next cycle...[/]",
+                                end="\r",
+                            )
+                            await asyncio.sleep(0.5)
+
+                    except Exception as e:
+                        # Catch any unexpected errors and continue scanning
+                        self.console.print(
+                            f"[bold yellow]Scan error: {e}. Restarting scan...[/]"
+                        )
+                        await asyncio.sleep(1.0)
+
+                    # Update UI even if an error occurred
+                    live.update(self._update_ui())
+
+                    # Always process input to ensure user can exit
+                    await self._process_input()
 
         finally:
             # Clear the terminal when finishing scan
@@ -3594,12 +3759,23 @@ class TagFinder:
 
         elif choice == "3":
             range_mode = "Maximum"
-            extended_retries = 3  # All scan phases
-            detection_threshold = -95  # Maximum threshold
-            scan_duration = 15.0  # Maximum duration
-            scan_timeout = 10.0
+            extended_retries = 4  # Increased for ultra-aggressive scanning
+            detection_threshold = -100  # Ultra-sensitive threshold for maximum range
+            scan_duration = 20.0  # Extended duration for thorough scanning
+            scan_timeout = 15.0  # Longer timeout to allow weak signals to be processed
 
-            self.console.print("[green]Maximum range mode selected[/]")
+            # Update advanced scan settings for maximum aggressiveness
+            ADVANCED_SCAN_SETTINGS["multi_adapter"] = (
+                True  # Try to use all available adapters
+            )
+            ADVANCED_SCAN_SETTINGS["combine_results"] = True  # Combine all results
+            ADVANCED_SCAN_SETTINGS["use_extended_features"] = (
+                True  # Use all extended features
+            )
+
+            self.console.print(
+                "[bold green]Maximum range mode selected - Ultra-aggressive scanning enabled[/]"
+            )
 
         else:
             self.console.print("[yellow]Invalid choice. Keeping current settings.[/]")
