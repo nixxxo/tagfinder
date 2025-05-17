@@ -494,10 +494,10 @@ class Device:
 
             # Add confidence indicator to tracker type
             confidence_indicators = {
-                TRACKING_CONFIDENCE["CONFIRMED"]: "✓",  # Confirmed
-                TRACKING_CONFIDENCE["HIGH"]: "!",  # High confidence
-                TRACKING_CONFIDENCE["MEDIUM"]: "?",  # Medium confidence
-                TRACKING_CONFIDENCE["LOW"]: "??",  # Low confidence
+                TRACKING_CONFIDENCE["CONFIRMED"]: "✅",  # Confirmed
+                TRACKING_CONFIDENCE["HIGH"]: "👍",  # High confidence
+                TRACKING_CONFIDENCE["MEDIUM"]: "🤷‍♂️",  # Medium confidence
+                TRACKING_CONFIDENCE["LOW"]: "👎",  # Low confidence
                 TRACKING_CONFIDENCE["UNLIKELY"]: "",  # Unlikely/No indicator
             }
 
