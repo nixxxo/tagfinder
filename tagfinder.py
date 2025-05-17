@@ -92,7 +92,6 @@ COMPANY_IDENTIFIERS = {
     0x0059: "Nordic Semiconductor",
     0x0001: "Ericsson",
     0x0002: "Intel",
-    0x00E0: "Google",
     0x0087: "Garmin",
     0x0157: "Anhui Huami",
     0x038F: "Xiaomi",
@@ -100,12 +99,42 @@ COMPANY_IDENTIFIERS = {
     0x0157: "Fitbit",
     0x012D: "Sony Ericsson",
     0x008A: "Tencent",
-    0x00E0: "Vivo",
+    0x000D: "Vivo",
     0x01D7: "Qualcomm",
     0x0BDA: "Samsung Electronics",
     0x0131: "Cypress Semiconductor",
-    0x0131: "Chipolo",
+    0x010C: "Chipolo",
     0x0A12: "Cambridge Silicon Radio",
+    0x008C: "Bose",
+    0x0590: "Logitech",
+    0x0180: "LG Electronics",
+    0x003B: "Hewlett-Packard",
+    0x00F0: "GN Netcom (Jabra)",
+    0x0154: "Amazon",
+    0x0217: "Anker",
+    0x0053: "Nokia",
+    0x001D: "Qualcomm",
+    0x0030: "ST Microelectronics",
+    0x0198: "Fossil",
+    0x010F: "Huawei",
+    0x0214: "OPPO",
+    0x018D: "Realme",
+    0x000C: "OnePlus",
+    0x057C: "Lenovo",
+    0x01A9: "Dell",
+    0x0D13: "Roku",
+    0x008D: "Sonos",
+    0x04C6: "JBL",
+    0x012C: "Sonoff",
+    0x0150: "TP-Link",
+    0x0151: "Tuya",
+    0x01DF: "FitBit",
+    0x054C: "Sony",
+    0x022B: "iTag",
+    0x022A: "Nutale",
+    0x02FF: "NUT",
+    0x07BA: "Radbeacon",
+    0x0183: "PEBBLEBEE",
 }
 
 # Device types based on services or characteristics
@@ -156,7 +185,15 @@ APPLE_DEVICE_TYPES = {
     0x0A: "AirTag",
     0x0B: "Apple Pencil",
     0x0C: "Apple Vision Pro",
+    0x0D: "Apple Beats",
+    0x0E: "Apple Keyboard",
     0x0F: "Apple Network Adapter",
+    0x10: "Apple Magic Mouse",
+    0x11: "Apple Magic Trackpad",
+    0x12: "AirPods Pro",
+    0x13: "AirPods Max",
+    0x14: "AirPods 2nd Gen",
+    0x15: "AirPods 3rd Gen",
 }
 
 # Tracking device types
@@ -300,11 +337,44 @@ class Device:
         """Extract device type from BLE advertisement data"""
         device_type = "BLE Device"
 
+        # Check service UUIDs for known device types
+        if self.service_uuids:
+            for uuid in self.service_uuids:
+                uuid_upper = uuid.upper()
+                # Health & Fitness devices
+                if "180D" in uuid_upper:  # Heart Rate service
+                    return "Heart Rate Monitor"
+                elif "1826" in uuid_upper:  # Fitness Machine service
+                    return "Fitness Equipment"
+                elif "1809" in uuid_upper:  # Health Thermometer service
+                    return "Health Thermometer"
+                elif (
+                    "183A" in uuid_upper or "181A" in uuid_upper
+                ):  # Environmental Sensing
+                    return "Environmental Sensor"
+                elif "1819" in uuid_upper:  # Location and Navigation
+                    return "Location Tracker"
+
         # Check for Apple device type flag in manufacturer data
         if 76 in self.manufacturer_data and len(self.manufacturer_data[76]) > 2:
             apple_type_byte = self.manufacturer_data[76][2] & 0x0F
             if apple_type_byte in APPLE_DEVICE_TYPES:
                 device_type = APPLE_DEVICE_TYPES[apple_type_byte]
+
+                # For AirPods, try to get more specific model
+                if apple_type_byte == 0x09 and len(self.manufacturer_data[76]) >= 4:
+                    # The 4th byte can sometimes identify specific AirPods models
+                    model_byte = self.manufacturer_data[76][3] & 0x0F
+                    if model_byte == 0x01:
+                        return "AirPods 1st Gen"
+                    elif model_byte == 0x02:
+                        return "AirPods 2nd Gen"
+                    elif model_byte == 0x03:
+                        return "AirPods Pro"
+                    elif model_byte == 0x04:
+                        return "AirPods Max"
+                    elif model_byte == 0x05:
+                        return "AirPods 3rd Gen"
 
         # Check the name for more specific information
         if self.name:
@@ -312,51 +382,244 @@ class Device:
 
             # Prioritize name over manufacturer data for Apple devices
             if "iphone" in name_lower:
+                # Try to extract iPhone model
+                if "12" in name_lower:
+                    return "iPhone 12"
+                elif "13" in name_lower:
+                    return "iPhone 13"
+                elif "14" in name_lower:
+                    return "iPhone 14"
+                elif "15" in name_lower:
+                    return "iPhone 15"
+                elif "11" in name_lower:
+                    return "iPhone 11"
+                elif "xs" in name_lower:
+                    return "iPhone XS"
+                elif "xr" in name_lower:
+                    return "iPhone XR"
+                elif "se" in name_lower:
+                    return "iPhone SE"
+                elif "x" in name_lower:
+                    return "iPhone X"
                 return "iPhone"
             elif "ipad" in name_lower:
+                # Try to extract iPad model
+                if "pro" in name_lower:
+                    return "iPad Pro"
+                elif "air" in name_lower:
+                    return "iPad Air"
+                elif "mini" in name_lower:
+                    return "iPad Mini"
                 return "iPad"
             elif "macbook" in name_lower or "mac book" in name_lower:
+                if "pro" in name_lower:
+                    return "MacBook Pro"
+                elif "air" in name_lower:
+                    return "MacBook Air"
                 return "MacBook"
             elif "imac" in name_lower:
                 return "iMac"
-            elif (
-                "apple watch" in name_lower
-                or "watch" in name_lower
-                and self.manufacturer == "Apple"
+            elif "mac mini" in name_lower or "macmini" in name_lower:
+                return "Mac Mini"
+            elif "apple watch" in name_lower or (
+                "watch" in name_lower and self.manufacturer == "Apple"
             ):
+                # Try to identify Apple Watch series
+                if "series 8" in name_lower or "s8" in name_lower:
+                    return "Apple Watch S8"
+                elif "series 7" in name_lower or "s7" in name_lower:
+                    return "Apple Watch S7"
+                elif "series 6" in name_lower or "s6" in name_lower:
+                    return "Apple Watch S6"
+                elif "series 5" in name_lower or "s5" in name_lower:
+                    return "Apple Watch S5"
+                elif "se" in name_lower:
+                    return "Apple Watch SE"
+                elif "ultra" in name_lower:
+                    return "Apple Watch Ultra"
                 return "Apple Watch"
             elif "airpod" in name_lower:
+                if "pro" in name_lower:
+                    if "2" in name_lower:
+                        return "AirPods Pro 2"
+                    return "AirPods Pro"
+                elif "max" in name_lower:
+                    return "AirPods Max"
+                elif "3" in name_lower:
+                    return "AirPods 3rd Gen"
+                elif "2" in name_lower:
+                    return "AirPods 2nd Gen"
                 return "AirPods"
             elif "airtag" in name_lower:
                 return "AirTag"
+            elif "beats" in name_lower:
+                if "studio" in name_lower:
+                    return "Beats Studio"
+                elif "solo" in name_lower:
+                    return "Beats Solo"
+                elif "flex" in name_lower:
+                    return "Beats Flex"
+                elif "fit" in name_lower:
+                    return "Beats Fit Pro"
+                elif "pill" in name_lower:
+                    return "Beats Pill"
+                return "Beats Headphones"
 
-            # Non-Apple devices
-            elif "watch" in name_lower:
-                return "Smartwatch"
+            # Non-Apple devices with enhanced detection
+            elif "samsung" in name_lower:
+                if "watch" in name_lower:
+                    if "galaxy" in name_lower:
+                        return "Samsung Galaxy Watch"
+                    return "Samsung Smartwatch"
+                elif "bud" in name_lower or "earbud" in name_lower:
+                    if "pro" in name_lower:
+                        return "Samsung Galaxy Buds Pro"
+                    elif "live" in name_lower:
+                        return "Samsung Galaxy Buds Live"
+                    return "Samsung Galaxy Buds"
+                elif "tag" in name_lower or "smart tag" in name_lower:
+                    return "Samsung SmartTag"
+            elif "galaxy" in name_lower and "bud" in name_lower:
+                return "Samsung Galaxy Buds"
+            elif "google" in name_lower:
+                if "pixel bud" in name_lower:
+                    return "Google Pixel Buds"
+                elif "nest" in name_lower:
+                    return "Google Nest Device"
+            elif "nest" in name_lower:
+                return "Google Nest Device"
+            elif (
+                "xiaomi" in name_lower or "mi " in name_lower or "mi band" in name_lower
+            ):
+                if "band" in name_lower:
+                    return "Xiaomi Mi Band"
+                if "bud" in name_lower:
+                    return "Xiaomi Earbuds"
+            elif "fitbit" in name_lower:
+                if "versa" in name_lower:
+                    return "Fitbit Versa"
+                elif "sense" in name_lower:
+                    return "Fitbit Sense"
+                elif "charge" in name_lower:
+                    return "Fitbit Charge"
+                return "Fitbit Tracker"
+            elif "amazfit" in name_lower:
+                return "Amazfit Smartwatch"
+            elif "oneplus" in name_lower and "bud" in name_lower:
+                return "OnePlus Buds"
+            elif "sony" in name_lower:
+                if "wh-1000" in name_lower:
+                    return "Sony WH-1000 Headphones"
+                elif "wf" in name_lower and (
+                    "bud" in name_lower or "earphone" in name_lower
+                ):
+                    return "Sony WF Earbuds"
+                return "Sony Audio Device"
+            elif "bose" in name_lower:
+                if "qc" in name_lower or "quietcomfort" in name_lower:
+                    return "Bose QuietComfort"
+                return "Bose Audio Device"
+            elif "jabra" in name_lower:
+                if "elite" in name_lower:
+                    return "Jabra Elite Earbuds"
+                return "Jabra Headset"
+            elif "watch" in name_lower or "band" in name_lower:
+                return "Smartwatch/Fitness Band"
             elif (
                 "headphone" in name_lower
                 or "earphone" in name_lower
                 or "earbud" in name_lower
+                or "bud" in name_lower
+                or "hearable" in name_lower
             ):
-                return "Headphones"
+                return "Headphones/Earbuds"
             elif "speaker" in name_lower:
-                return "Speaker"
+                return "Bluetooth Speaker"
             elif "tag" in name_lower or "tracker" in name_lower:
-                return "Tracker"
+                if "tile" in name_lower:
+                    return "Tile Tracker"
+                elif "chipolo" in name_lower:
+                    return "Chipolo Tracker"
+                return "Bluetooth Tracker"
             elif "tv" in name_lower:
-                return "TV"
+                return "Smart TV"
+            elif "roku" in name_lower:
+                return "Roku Device"
             elif "remote" in name_lower:
                 return "Remote Control"
             elif "keyboard" in name_lower:
-                return "Keyboard"
+                return "Bluetooth Keyboard"
             elif "mouse" in name_lower:
-                return "Mouse"
+                return "Bluetooth Mouse"
             elif "car" in name_lower or "auto" in name_lower:
                 return "Car Accessory"
             elif "phone" in name_lower:
-                return "Phone"
+                return "Smartphone"
             elif "pad" in name_lower or "tablet" in name_lower:
                 return "Tablet"
+            elif "camera" in name_lower:
+                return "Bluetooth Camera"
+            elif "printer" in name_lower:
+                return "Bluetooth Printer"
+            elif "scale" in name_lower:
+                return "Smart Scale"
+            elif "lock" in name_lower:
+                return "Smart Lock"
+            elif "door" in name_lower or "bell" in name_lower:
+                return "Smart Doorbell"
+            elif "light" in name_lower or "bulb" in name_lower:
+                return "Smart Light"
+            elif "therm" in name_lower:
+                return "Smart Thermostat"
+            elif "sensor" in name_lower:
+                return "IoT Sensor"
+
+        # Check manufacturer data for device type clues
+        for company_id in self.manufacturer_data:
+            # Samsung devices
+            if company_id == 0x0075 or company_id == 0x0BDA:
+                if device_type == "BLE Device":
+                    data = self.manufacturer_data[company_id]
+                    if len(data) > 3:
+                        device_byte = data[2] if len(data) > 2 else 0x00
+                        if device_byte == 0x01:
+                            return "Samsung Phone"
+                        elif device_byte == 0x02:
+                            return "Samsung Tablet"
+                        elif device_byte == 0x03:
+                            return "Samsung Watch"
+                        elif device_byte == 0x04:
+                            return "Samsung Buds"
+                        elif device_byte == 0x05:
+                            return "Samsung SmartTag"
+                        return "Samsung Device"
+
+            # Tile trackers
+            elif company_id == 0x02D0:
+                return "Tile Tracker"
+
+            # Chipolo trackers
+            elif company_id == 0x010C:
+                return "Chipolo Tracker"
+
+            # Fitbit devices
+            elif company_id == 0x01DF or company_id == 0x0157:
+                return "Fitbit Device"
+
+        # Check for specific iBeacon/Eddystone formats
+        for company_id, data in self.manufacturer_data.items():
+            # Apple iBeacon format
+            if (
+                company_id == 0x004C
+                and len(data) >= 23
+                and data[0] == 0x02
+                and data[1] == 0x15
+            ):
+                return "iBeacon"
+
+            # Eddystone format
+            if company_id == 0x00E0 and len(data) >= 20:
+                return "Eddystone Beacon"
 
         # Keep the Apple device type from manufacturer data if we didn't find a better match
         return device_type
@@ -370,15 +633,6 @@ class Device:
             mac_parts = self.address.split(":")
             details.append(f"MAC: {':'.join(mac_parts[-3:])}")
 
-        # Signal stability
-        stability = self.signal_stability
-        if stability < 2.0:
-            details.append(f"Signal: Stable({stability:.1f})")
-        elif stability < 5.0:
-            details.append(f"Signal: Moderate({stability:.1f})")
-        else:
-            details.append(f"Signal: Unstable({stability:.1f})")
-
         # Parse Apple specific data
         if 76 in self.manufacturer_data:
             apple_data = self.manufacturer_data[76]
@@ -389,6 +643,14 @@ class Device:
                     # AirTag and Find My protocol specifics
                     if apple_data[0] == 0x12 and apple_data[1] == 0x19:
                         details.append("Find My Network")
+
+                        # Try to extract AirTag status bits if available
+                        if len(apple_data) >= 6:
+                            status_byte = apple_data[5]
+                            if status_byte & 0x01:
+                                details.append("Separated Mode")
+                            if status_byte & 0x02:
+                                details.append("Play Sound")
 
                     # AirPods battery levels
                     elif len(apple_data) >= 13 and (
@@ -402,6 +664,40 @@ class Device:
                                 details.append(
                                     f"L:{left_battery*10}% R:{right_battery*10}% C:{case_battery*10}%"
                                 )
+
+                            # Extract AirPods case status
+                            case_status = apple_data[8] & 0x03
+                            if case_status == 0x01:
+                                details.append("Case: Open")
+                            elif case_status == 0x02:
+                                details.append("Case: Closed")
+
+                            # Extract in-ear detection status if available
+                            if len(apple_data) >= 11:
+                                ear_status = apple_data[10] & 0x03
+                                if ear_status == 0x01:
+                                    details.append("In-Ear: Left")
+                                elif ear_status == 0x02:
+                                    details.append("In-Ear: Right")
+                                elif ear_status == 0x03:
+                                    details.append("In-Ear: Both")
+
+                    # Apple Watch info
+                    elif apple_data[0] == 0x10 and len(apple_data) >= 8:
+                        watch_status = apple_data[6]
+                        if watch_status & 0x01:
+                            details.append("Watch: Unlocked")
+                        if watch_status & 0x02:
+                            details.append("Watch: Active")
+                        watch_battery = apple_data[7] & 0x0F
+                        if watch_battery <= 10:
+                            details.append(f"Battery: {watch_battery*10}%")
+
+                    # iPhone/iPad info
+                    elif apple_data[0] == 0x0C and len(apple_data) >= 5:
+                        phone_status = apple_data[4]
+                        if phone_status & 0x01:
+                            details.append("Unlocked")
                 except:
                     pass
 
@@ -423,6 +719,69 @@ class Device:
                 except:
                     pass
 
+            elif "180F" in uuid.upper():  # Battery Service
+                try:
+                    if len(data) >= 1:
+                        battery = data[0]
+                        details.append(f"Battery: {battery}%")
+                except:
+                    pass
+
+            elif "1826" in uuid.upper():  # Fitness Machine Service
+                try:
+                    if len(data) >= 2:
+                        # Various fitness machine data could be extracted here
+                        details.append("Fitness Data")
+                except:
+                    pass
+
+            elif "FD5A" in uuid.upper():  # Samsung SmartTag
+                details.append("SmartTag")
+
+            elif "FDCD" in uuid.upper():  # Tile
+                details.append("Tile Tracker")
+
+        # Signal stability
+        stability = self.signal_stability
+        if stability < 2.0:
+            details.append(f"Signal: Stable({stability:.1f})")
+        elif stability < 5.0:
+            details.append(f"Signal: Moderate({stability:.1f})")
+        else:
+            details.append(f"Signal: Unstable({stability:.1f})")
+
+        # Add tx power if available
+        if "180A" in [uuid[-4:].upper() for uuid in self.service_uuids]:
+            # This is an approximation; actual TX power would need connection
+            details.append("Tx Power: Standard")
+
+        # Attempt to extract device firmware/hardware version info
+        if "180A" in [uuid[-4:].upper() for uuid in self.service_uuids]:
+            # Device Information service present
+            details.append("Has Device Info")
+
+        # Check for iBeacon data pattern
+        for company_id, data in self.manufacturer_data.items():
+            if (
+                company_id == 0x004C
+                and len(data) >= 23
+                and data[0] == 0x02
+                and data[1] == 0x15
+            ):
+                # iBeacon format detected
+                try:
+                    # Extract UUID from iBeacon format
+                    uuid_bytes = data[2:18]
+                    uuid_str = "".join(f"{b:02x}" for b in uuid_bytes)
+                    uuid_formatted = f"{uuid_str[:8]}-{uuid_str[8:12]}-{uuid_str[12:16]}-{uuid_str[16:20]}-{uuid_str[20:]}"
+
+                    # Extract Major and Minor values
+                    major = (data[18] << 8) | data[19]
+                    minor = (data[20] << 8) | data[21]
+                    details.append(f"iBeacon: {major}.{minor}")
+                except:
+                    details.append("iBeacon")
+
         # Add service UUIDs if present
         if self.service_uuids and len(self.service_uuids) > 0:
             known_services = []
@@ -438,6 +797,16 @@ class Device:
                 if len(known_services) > 2:
                     services_str += f" +{len(known_services)-2}"
                 details.append(f"Services: {services_str}")
+
+        # Check for specific trackers
+        if self.is_airtag:
+            tracker_type = self.get_tracker_type()
+            if (
+                tracker_type != "Not a tracker"
+                and "Find My Network" not in details
+                and "AirTag" not in details
+            ):
+                details.append(f"Tracker: {tracker_type}")
 
         # Make string from details
         if details:
@@ -1012,14 +1381,19 @@ class TagFinder:
 
         # Add columns with responsive width settings
         table.add_column("Name", style="cyan", ratio=4, no_wrap=False)
-        table.add_column("Type", ratio=3, no_wrap=False)
+        table.add_column("Type", ratio=2, no_wrap=False)
+
+        # Always show MAC address column
+        table.add_column("MAC", ratio=2, no_wrap=False)
 
         # Only show manufacturer column if space permits or no device is selected
         if not has_selected or self.console.width > 100:
             table.add_column("Manufacturer", ratio=2, no_wrap=False)
 
+        # Separate RSSI and Signal columns
         table.add_column("RSSI", justify="right", ratio=1)
-        table.add_column("Distance", justify="right", ratio=2)
+        table.add_column("Signal", justify="right", ratio=1)
+        table.add_column("Distance", justify="right", ratio=1)
 
         # Only show seen time column if no device is selected
         if not has_selected or self.console.width > 120:
@@ -1027,7 +1401,7 @@ class TagFinder:
 
         # Always show details but adjust width based on available space
         if self.console.width > 140:
-            table.add_column("Details", ratio=5, no_wrap=False)
+            table.add_column("Details", ratio=4, no_wrap=False)
         else:
             table.add_column("Details", ratio=3, no_wrap=False)
 
@@ -1094,20 +1468,42 @@ class TagFinder:
             # Display detailed information without the seen time
             details = device.device_details if device.device_details else ""
 
+            # Format MAC address - just show last 6 characters for better readability
+            mac_display = (
+                device.address.split(":")[-3:]
+                if ":" in device.address
+                else device.address[-6:]
+            )
+            if isinstance(mac_display, list):
+                mac_display = ":".join(mac_display)
+
+            # Get signal quality as a percentage
+            signal_quality = f"{device.signal_quality:.0f}%"
+
+            # Color code signal quality
+            if device.signal_quality > 70:
+                signal_color = "green"
+            elif device.signal_quality > 40:
+                signal_color = "yellow"
+            else:
+                signal_color = "red"
+
             # Build row data based on which columns are enabled
             row_data = [
                 Text(f"{idx_display} {device.name}", style=f"{name_color} {style}"),
                 device.device_type,
+                mac_display,  # Add MAC address column
             ]
 
             # Add manufacturer column if it exists
             if not has_selected or self.console.width > 100:
                 row_data.append(device.manufacturer)
 
-            # Always add RSSI and distance
+            # Always add RSSI, signal quality, and distance
             row_data.extend(
                 [
                     Text(rssi_str, style=f"{rssi_color} {style}"),
+                    Text(signal_quality, style=f"{signal_color} {style}"),
                     distance,
                 ]
             )
@@ -1175,7 +1571,7 @@ class TagFinder:
                         " [bold blue]d[/] - Toggle adaptive mode",
                         " [bold blue]c[/] - Toggle calibration mode",
                         " [bold blue]l[/] - List Bluetooth adapters",
-                        " [bold blue]z[/] - Summarize findings",
+                        " [bold blue]z[/] - Analyze & Summarize findings",
                         " [bold blue]q[/] - Quit",
                     ]
                 ),
@@ -1213,7 +1609,7 @@ class TagFinder:
                     [
                         "[bold cyan]Controls:[/]",
                         " [bold blue]s[/] - Scan [bold blue]a[/] - AirTag mode [bold blue]d[/] - Adaptive",
-                        " [bold blue]c[/] - Calibration [bold blue]l[/] - Adapters [bold blue]z[/] - Summary [bold blue]q[/] - Quit",
+                        " [bold blue]c[/] - Calibration [bold blue]l[/] - Adapters [bold blue]z[/] - Analyze [bold blue]q[/] - Quit",
                         "",
                         f"[bold]Status:[/] [yellow]Idle[/] | AirTag: {airtag_mode} | Adaptive: {adaptive_mode} | Calib: {calibration_mode}",
                         f"[bold]Adapter:[/] {self.current_adapter or 'Default'}",
@@ -1395,7 +1791,7 @@ class TagFinder:
         )
 
     def summarize_findings(self):
-        """Summarize findings from history or current scan"""
+        """Summarize findings from history or current scan with options for overall summary or device details"""
         # Clear terminal before showing summary
         self.console.clear()
 
@@ -1423,6 +1819,23 @@ class TagFinder:
             self.console.print("[yellow]No devices found in history or current scan[/]")
             return
 
+        # Show summary options
+        self.console.print("[bold cyan]Summary Options:[/]")
+        self.console.print("[1] Overall Summary Analytics")
+        self.console.print("[2] Detailed Device Summary")
+
+        choice = self.console.input("[bold blue]Select an option (1/2): [/]")
+
+        if choice == "1":
+            self._show_overall_summary(unique_devices)
+        elif choice == "2":
+            self._show_device_selection(unique_devices)
+        else:
+            self.console.print("[yellow]Invalid option. Showing overall summary.[/]")
+            self._show_overall_summary(unique_devices)
+
+    def _show_overall_summary(self, unique_devices):
+        """Show overall statistics and analytics for all devices"""
         # Count and categorize
         total_devices = len(unique_devices)
         airtags = [d for d in unique_devices.values() if d.get("is_airtag", False)]
@@ -1442,29 +1855,500 @@ class TagFinder:
         min_distance = min(distances) if distances else 0
         max_distance = max(distances) if distances else 0
 
+        # Device type statistics
+        device_types = {}
+        manufacturers = {}
+
+        for device in unique_devices.values():
+            device_type = device.get("device_type", "Unknown")
+            if device_type in device_types:
+                device_types[device_type] += 1
+            else:
+                device_types[device_type] = 1
+
+            manufacturer = device.get("manufacturer", "Unknown")
+            if manufacturer in manufacturers:
+                manufacturers[manufacturer] += 1
+            else:
+                manufacturers[manufacturer] = 1
+
+        # Sort by frequency
+        top_types = sorted(device_types.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_manufacturers = sorted(
+            manufacturers.items(), key=lambda x: x[1], reverse=True
+        )[:5]
+
+        # Time-based statistics
+        now = time.time()
+        first_seen = min(d.get("first_seen", now) for d in unique_devices.values())
+        scan_duration = now - first_seen
+
+        # Recently active devices (within last 5 minutes)
+        recent_devices = [
+            d
+            for d in unique_devices.values()
+            if now - d.get("last_seen", 0) < 300  # 5 minutes
+        ]
+
         # Display summary
+        summary_text = [
+            f"[bold cyan]Basic Statistics:[/]",
+            f"[bold]Total unique devices:[/] {total_devices}",
+            f"[bold]AirTags/Find My devices:[/] {len(airtags)}",
+            f"[bold]Recently active devices:[/] {len(recent_devices)}",
+            f"[bold]Scan duration:[/] {scan_duration:.1f} seconds",
+            "",
+            f"[bold cyan]Proximity Analysis:[/]",
+            f"[bold]Closest device:[/] {closest_device.get('name', 'Unknown')} ({closest_device['address']})",
+            f"[bold]Closest signal strength:[/] {strongest_signal} dBm",
+            f"[bold]Estimated distance:[/] {10 ** ((DEFAULT_RSSI_AT_ONE_METER - strongest_signal) / (10 * DEFAULT_DISTANCE_N_VALUE)):.2f} meters",
+            f"[bold]Average distance:[/] {avg_distance:.2f} meters",
+            f"[bold]Min distance:[/] {min_distance:.2f} meters",
+            f"[bold]Max distance:[/] {max_distance:.2f} meters",
+            "",
+            f"[bold cyan]Device Type Distribution:[/]",
+        ]
+
+        # Add device type distribution
+        for device_type, count in top_types:
+            percentage = (count / total_devices) * 100
+            summary_text.append(f"[bold]{device_type}:[/] {count} ({percentage:.1f}%)")
+
+        summary_text.append("")
+        summary_text.append(f"[bold cyan]Manufacturer Distribution:[/]")
+
+        # Add manufacturer distribution
+        for manufacturer, count in top_manufacturers:
+            percentage = (count / total_devices) * 100
+            summary_text.append(f"[bold]{manufacturer}:[/] {count} ({percentage:.1f}%)")
+
+        # Add security warning if AirTags are found
+        if airtags:
+            summary_text.append("")
+            summary_text.append(
+                f"[bold red]Security Warning:[/] {len(airtags)} tracking devices detected"
+            )
+
+            # List the tracking devices
+            for i, device in enumerate(airtags[:3], 1):  # Show top 3
+                device_type = device.get("device_type", "Unknown Tracker")
+                last_seen_ago = now - device.get("last_seen", now)
+                summary_text.append(
+                    f"  {i}. [bold yellow]{device.get('name', 'Unnamed')}[/] - "
+                    f"{device_type} - Last seen {format_time_ago(last_seen_ago)} ago"
+                )
+
+            if len(airtags) > 3:
+                summary_text.append(
+                    f"  ...and {len(airtags) - 3} more tracking devices"
+                )
+
+        # Create the panel
         summary = Panel(
-            "\n".join(
-                [
-                    f"[bold]Total unique devices:[/] {total_devices}",
-                    f"[bold]AirTags/Find My devices:[/] {len(airtags)}",
-                    f"[bold]Closest device:[/] {closest_device.get('name', 'Unknown')} ({closest_device['address']})",
-                    f"[bold]Closest signal strength:[/] {strongest_signal} dBm",
-                    f"[bold]Estimated distance:[/] {10 ** ((DEFAULT_RSSI_AT_ONE_METER - strongest_signal) / (10 * DEFAULT_DISTANCE_N_VALUE)):.2f} meters",
-                    "",
-                    f"[bold]Average distance:[/] {avg_distance:.2f} meters",
-                    f"[bold]Min distance:[/] {min_distance:.2f} meters",
-                    f"[bold]Max distance:[/] {max_distance:.2f} meters",
-                    "",
-                    f"[bold]Scan duration:[/] {time.time() - min(d.get('first_seen', time.time()) for d in unique_devices.values()):.1f} seconds",
-                ]
-            ),
-            title="[bold green]Scan Summary[/]",
+            "\n".join(summary_text),
+            title="[bold green]Overall Scan Summary[/]",
             border_style="green",
             box=ROUNDED,
         )
 
         self.console.print(summary)
+
+    def _show_device_selection(self, unique_devices):
+        """Show a device selection interface and then detailed info for the selected device"""
+        # Create a table to display the devices
+        table = Table(
+            title="[bold]Available Devices[/]",
+            box=ROUNDED,
+            highlight=True,
+            title_style="bold cyan",
+            border_style="blue",
+        )
+
+        # Add columns
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("Name", style="green")
+        table.add_column("Type", style="magenta")
+        table.add_column("Manufacturer")
+        table.add_column("RSSI", justify="right")
+        table.add_column("Last Seen")
+
+        # Add rows
+        device_map = {}
+        for i, (addr, device) in enumerate(
+            sorted(
+                unique_devices.items(),
+                key=lambda x: x[1].get("rssi", -999),
+                reverse=True,
+            )
+        ):
+            if i >= 30:  # Limit to top 30 devices to avoid overflow
+                break
+
+            device_id = i + 1
+            device_map[device_id] = addr
+
+            name = device.get("name", "Unknown")
+            device_type = device.get("device_type", "BLE Device")
+            manufacturer = device.get("manufacturer", "Unknown")
+            rssi = device.get("rssi", "N/A")
+
+            # Format last seen time
+            last_seen = device.get("last_seen", time.time())
+            last_seen_ago = time.time() - last_seen
+            last_seen_str = format_time_ago(last_seen_ago) + " ago"
+
+            # Highlight AirTags/trackers
+            row_style = "bold red" if device.get("is_airtag", False) else ""
+
+            table.add_row(
+                str(device_id),
+                name,
+                device_type,
+                manufacturer,
+                str(rssi),
+                last_seen_str,
+                style=row_style,
+            )
+
+        # Display the table
+        self.console.print(table)
+
+        # Ask user to select a device
+        device_choice = self.console.input(
+            "\n[bold blue]Enter device ID for detailed info (or q to quit): [/]"
+        )
+
+        if device_choice.lower() == "q":
+            return
+
+        try:
+            device_id = int(device_choice)
+            if device_id in device_map:
+                selected_addr = device_map[device_id]
+                selected_device = unique_devices[selected_addr]
+                self._show_detailed_device_info(selected_device)
+            else:
+                self.console.print(
+                    "[yellow]Invalid device ID. Returning to main menu.[/]"
+                )
+        except ValueError:
+            self.console.print("[yellow]Invalid input. Returning to main menu.[/]")
+
+    def _show_detailed_device_info(self, device_data):
+        """Show comprehensive details about a selected device"""
+        # Clear the screen for detailed view
+        self.console.clear()
+
+        # Create a Device object from the dictionary if it's in dictionary form
+        if isinstance(device_data, dict):
+            try:
+                device = Device.from_dict(device_data)
+            except Exception as e:
+                # If conversion fails, work with the raw dictionary
+                self.console.print(
+                    f"[yellow]Warning: Could not convert to Device object: {e}[/]"
+                )
+                device = None
+        else:
+            device = device_data
+
+        # If we couldn't create a Device object, show basic info from the dictionary
+        if device is None:
+            self._show_raw_device_info(device_data)
+            return
+
+        # Create a rich text object for the detailed info
+        details_text = Text()
+
+        # Device Identification Section
+        details_text.append("\n◉ ", style="bold green")
+        details_text.append("Device Identification", style="bold yellow")
+        details_text.append("\n\n")
+
+        details_text.append(f"Name: ", style="bold")
+        details_text.append(f"{device.name or 'Unknown'}\n")
+
+        details_text.append(f"Address: ", style="bold")
+        details_text.append(f"{device.address}\n")
+
+        details_text.append(f"Device Type: ", style="bold")
+        details_text.append(f"{device.device_type}\n")
+
+        details_text.append(f"Manufacturer: ", style="bold")
+        details_text.append(f"{device.manufacturer}\n")
+
+        # If it's a tracker, add a warning section
+        if device.is_airtag:
+            tracker_type = device.get_tracker_type()
+            details_text.append("\n")
+            details_text.append(
+                "⚠️  TRACKING DEVICE DETECTED  ⚠️", style="bold white on red"
+            )
+            details_text.append("\n")
+            details_text.append(f"Tracker Type: ", style="bold red")
+            details_text.append(f"{tracker_type}\n", style="bold red")
+
+        # Signal Information Section
+        details_text.append("\n◉ ", style="bold green")
+        details_text.append("Signal Information", style="bold yellow")
+        details_text.append("\n\n")
+
+        details_text.append(f"RSSI Value: ", style="bold")
+        rssi_style = (
+            "green" if device.rssi > -70 else "yellow" if device.rssi > -85 else "red"
+        )
+        details_text.append(f"{device.rssi} dBm\n", style=rssi_style)
+
+        details_text.append(f"Signal Quality: ", style="bold")
+        quality = device.signal_quality
+        quality_style = "green" if quality > 70 else "yellow" if quality > 40 else "red"
+        details_text.append(f"{quality:.1f}%\n", style=quality_style)
+
+        details_text.append(f"Signal Stability: ", style="bold")
+        stability = device.signal_stability
+        stability_style = (
+            "green" if stability < 3 else "yellow" if stability < 6 else "red"
+        )
+        details_text.append(f"{stability:.1f}\n", style=stability_style)
+
+        details_text.append(f"Estimated Distance: ", style="bold")
+        distance = device.distance
+        distance_label = f"{distance:.2f} meters"
+        if distance < 1:
+            distance_label += f" ({distance * 100:.0f} cm)"
+        distance_style = (
+            "green" if distance < 2 else "yellow" if distance < 5 else "red"
+        )
+        details_text.append(f"{distance_label}\n", style=distance_style)
+
+        # Time Information
+        details_text.append("\n◉ ", style="bold green")
+        details_text.append("Time Information", style="bold yellow")
+        details_text.append("\n\n")
+
+        details_text.append(f"First Seen: ", style="bold")
+        first_seen_ago = time.time() - device.first_seen
+        details_text.append(
+            f"{time.strftime('%H:%M:%S', time.localtime(device.first_seen))} "
+            f"({format_time_ago(first_seen_ago)} ago)\n"
+        )
+
+        details_text.append(f"Last Seen: ", style="bold")
+        last_seen_ago = time.time() - device.last_seen
+        details_text.append(
+            f"{time.strftime('%H:%M:%S', time.localtime(device.last_seen))} "
+            f"({format_time_ago(last_seen_ago)} ago)\n"
+        )
+
+        details_text.append(f"Tracked Duration: ", style="bold")
+        details_text.append(f"{format_time_ago(device.seen_duration)}\n")
+
+        # Technical Details Section
+        details_text.append("\n◉ ", style="bold green")
+        details_text.append("Technical Details", style="bold yellow")
+        details_text.append("\n\n")
+
+        # Extract as many details as we can
+        extracted_details = device.device_details
+        if extracted_details:
+            details_text.append(f"Extracted Data: ", style="bold")
+            details_text.append(f"{extracted_details}\n")
+
+        # Service UUIDs
+        if device.service_uuids:
+            details_text.append(f"Service UUIDs: ", style="bold")
+            details_text.append("\n")
+            for i, uuid in enumerate(device.service_uuids):
+                # Highlight known tracking UUIDs in red
+                if any(known_uuid in uuid.upper() for known_uuid in FIND_MY_UUIDS):
+                    details_text.append(f"  {i+1}. {uuid}", style="bold red")
+                else:
+                    details_text.append(f"  {i+1}. {uuid}")
+
+                # Add service name if known
+                uuid_short = uuid[-4:].upper()
+                if uuid_short in DEVICE_TYPES:
+                    details_text.append(f" - {DEVICE_TYPES[uuid_short]}")
+                details_text.append("\n")
+
+        # Manufacturer Data
+        if device.manufacturer_data:
+            details_text.append(f"Manufacturer Data: ", style="bold")
+            details_text.append("\n")
+            for company_id, data in device.manufacturer_data.items():
+                company_name = COMPANY_IDENTIFIERS.get(
+                    company_id, f"Unknown (0x{company_id:04X})"
+                )
+                details_text.append(f"  • {company_name}: ", style="bold")
+
+                # Show first 16 bytes with possible interpretation
+                hex_data = data.hex()
+                details_text.append(f"{hex_data}\n")
+
+                # Try to interpret the data
+                try:
+                    if company_id == 0x004C:  # Apple
+                        if len(data) >= 2:
+                            if data[0] == 0x12 and data[1] == 0x19:
+                                details_text.append(
+                                    "    ↳ Apple Find My Network Advertisement\n"
+                                )
+                            elif data[0] == 0x10:
+                                details_text.append("    ↳ Apple Watch Advertisement\n")
+                            elif data[0] == 0x07 and data[1] == 0x19:
+                                details_text.append(
+                                    "    ↳ AirPods Status Information\n"
+                                )
+                            elif data[0] == 0x02 and data[1] == 0x15:
+                                details_text.append("    ↳ iBeacon Advertisement\n")
+                except:
+                    pass
+
+        # Show in a panel
+        detail_panel = Panel(
+            details_text,
+            title=f"[bold green]Detailed Device Info: {device.name or 'Unknown'}[/]",
+            border_style="green",
+            box=ROUNDED,
+            width=100,
+            expand=False,
+        )
+
+        self.console.print(detail_panel)
+
+        # Show advice for trackers if applicable
+        if device.is_airtag:
+            tracker_advice = Panel(
+                "\n".join(
+                    [
+                        "[bold white]This appears to be a tracking device.[/] If you don't recognize it, consider:",
+                        "• Check if it's moving with you over time (could indicate unwanted tracking)",
+                        "• Look for physical devices in your belongings, vehicle, etc.",
+                        "• For AirTags: iPhone users will receive alerts, Android users can download Apple's Tracker Detect app",
+                        "• For unknown trackers: Consider using a Bluetooth scanner app to locate the physical device",
+                        "• Report suspicious tracking to local authorities",
+                    ]
+                ),
+                title="[bold red]Tracker Detection Advice[/]",
+                border_style="red",
+                box=ROUNDED,
+            )
+            self.console.print(tracker_advice)
+
+        # Wait for key press to continue
+        self.console.print("\n[bold blue]Press any key to return...[/]")
+
+        # Non-blocking wait for key press
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.getch()
+        else:
+            try:
+                import termios
+                import tty
+
+                # Save old terminal settings
+                old_settings = termios.tcgetattr(sys.stdin)
+                try:
+                    # Set terminal to raw mode
+                    tty.setraw(sys.stdin.fileno(), termios.TCSANOW)
+                    sys.stdin.read(1)
+                finally:
+                    # Restore terminal settings
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            except:
+                # Fallback if terminal handling fails
+                input()
+
+    def _show_raw_device_info(self, device_data):
+        """Show raw device data when we can't convert to a Device object"""
+        # Handle the case where we only have dictionary data
+
+        # Create a formatted view of the device data
+        details = []
+
+        details.append(f"[bold]Name:[/] {device_data.get('name', 'Unknown')}")
+        details.append(f"[bold]Address:[/] {device_data.get('address', 'Unknown')}")
+        details.append(f"[bold]Type:[/] {device_data.get('device_type', 'Unknown')}")
+        details.append(
+            f"[bold]Manufacturer:[/] {device_data.get('manufacturer', 'Unknown')}"
+        )
+        details.append(f"[bold]RSSI:[/] {device_data.get('rssi', 'Unknown')}")
+
+        if "distance" in device_data:
+            distance = device_data["distance"]
+            details.append(f"[bold]Estimated Distance:[/] {distance:.2f} meters")
+
+        if "first_seen" in device_data:
+            first_seen = device_data["first_seen"]
+            first_seen_ago = time.time() - first_seen
+            details.append(
+                f"[bold]First Seen:[/] {time.strftime('%H:%M:%S', time.localtime(first_seen))} "
+                f"({format_time_ago(first_seen_ago)} ago)"
+            )
+
+        if "last_seen" in device_data:
+            last_seen = device_data["last_seen"]
+            last_seen_ago = time.time() - last_seen
+            details.append(
+                f"[bold]Last Seen:[/] {time.strftime('%H:%M:%S', time.localtime(last_seen))} "
+                f"({format_time_ago(last_seen_ago)} ago)"
+            )
+
+        if "is_airtag" in device_data and device_data["is_airtag"]:
+            details.append(f"[bold red]⚠️ This appears to be a tracking device ⚠️[/]")
+
+        # Display all available fields
+        details.append("\n[bold cyan]All available data:[/]")
+        for key, value in device_data.items():
+            if key not in [
+                "name",
+                "address",
+                "device_type",
+                "manufacturer",
+                "rssi",
+                "distance",
+                "first_seen",
+                "last_seen",
+                "is_airtag",
+                "manufacturer_data",
+                "service_data",
+                "service_uuids",
+            ]:
+                details.append(f"[bold]{key}:[/] {value}")
+
+        # Create a panel to show the details
+        detail_panel = Panel(
+            "\n".join(details),
+            title=f"[bold green]Device Information[/]",
+            border_style="green",
+            box=ROUNDED,
+        )
+
+        self.console.print(detail_panel)
+
+        # Wait for key press to continue
+        self.console.print("\n[bold blue]Press any key to return...[/]")
+
+        # Non-blocking wait for key press
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.getch()
+        else:
+            try:
+                import termios
+                import tty
+
+                old_settings = termios.tcgetattr(sys.stdin)
+                try:
+                    tty.setraw(sys.stdin.fileno(), termios.TCSANOW)
+                    sys.stdin.read(1)
+                finally:
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            except:
+                input()
 
     async def discovery_callback(self, device, advertisement_data):
         """Callback for BleakScanner when a device is discovered"""
@@ -2095,6 +2979,7 @@ class TagFinder:
                 await self.list_adapters()
                 # Settings are saved in list_adapters() if adapter is changed
             elif cmd == "z":
+                # Run enhanced summary with options
                 self.summarize_findings()
             elif cmd == "c":
                 # Clear terminal before toggle
