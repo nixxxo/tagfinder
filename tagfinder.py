@@ -238,6 +238,7 @@ class Device:
         manufacturer_data: Optional[Dict] = None,
         service_data: Optional[Dict] = None,
         service_uuids: Optional[List] = None,
+        is_new: bool = False,
     ):
         self.address = address
         self.name = name or "Unknown"
@@ -251,6 +252,7 @@ class Device:
         self.is_airtag = self._check_if_airtag()
         self.calibrated_n_value = DEFAULT_DISTANCE_N_VALUE
         self.calibrated_rssi_at_one_meter = DEFAULT_RSSI_AT_ONE_METER
+        self.is_new = is_new  # Flag to mark if this is a newly discovered device
 
         # Extract extended information
         self.manufacturer = self._extract_manufacturer()
@@ -263,6 +265,7 @@ class Device:
         manufacturer_data: Optional[Dict] = None,
         service_data: Optional[Dict] = None,
         service_uuids: Optional[List] = None,
+        is_new: Optional[bool] = None,
     ):
         self.rssi = rssi
         self.rssi_history.append(rssi)
@@ -272,6 +275,8 @@ class Device:
             self.service_data = service_data
         if service_uuids:
             self.service_uuids = service_uuids
+        if is_new is not None:
+            self.is_new = is_new
         self.last_seen = time.time()
 
         # Update extracted information
@@ -628,10 +633,19 @@ class Device:
         """Extract detailed information from BLE advertisement data"""
         details = []
 
-        # Add MAC address short form
-        if ":" in self.address:
-            mac_parts = self.address.split(":")
-            details.append(f"MAC: {':'.join(mac_parts[-3:])}")
+        # First, check if this is a new device
+        if getattr(self, "is_new", False):
+            details.append("NEW DEVICE")
+
+        # Next, prioritize critical tracking device information
+        if self.is_airtag:
+            tracker_type = self.get_tracker_type()
+            if (
+                tracker_type != "Not a tracker"
+                and "Find My Network" not in details
+                and "AirTag" not in details
+            ):
+                details.append(f"⚠️ {tracker_type}")
 
         # Parse Apple specific data
         if 76 in self.manufacturer_data:
@@ -648,7 +662,7 @@ class Device:
                         if len(apple_data) >= 6:
                             status_byte = apple_data[5]
                             if status_byte & 0x01:
-                                details.append("Separated Mode")
+                                details.append("Separated")
                             if status_byte & 0x02:
                                 details.append("Play Sound")
 
@@ -662,7 +676,7 @@ class Device:
                             case_battery = apple_data[7] & 0x0F
                             if left_battery < 0x0F and right_battery < 0x0F:
                                 details.append(
-                                    f"L:{left_battery*10}% R:{right_battery*10}% C:{case_battery*10}%"
+                                    f"Batt: L:{left_battery*10}% R:{right_battery*10}% C:{case_battery*10}%"
                                 )
 
                             # Extract AirPods case status
@@ -685,10 +699,14 @@ class Device:
                     # Apple Watch info
                     elif apple_data[0] == 0x10 and len(apple_data) >= 8:
                         watch_status = apple_data[6]
+                        status_info = []
                         if watch_status & 0x01:
-                            details.append("Watch: Unlocked")
+                            status_info.append("Unlocked")
                         if watch_status & 0x02:
-                            details.append("Watch: Active")
+                            status_info.append("Active")
+                        if status_info:
+                            details.append(f"Watch: {', '.join(status_info)}")
+
                         watch_battery = apple_data[7] & 0x0F
                         if watch_battery <= 10:
                             details.append(f"Battery: {watch_battery*10}%")
@@ -697,9 +715,23 @@ class Device:
                     elif apple_data[0] == 0x0C and len(apple_data) >= 5:
                         phone_status = apple_data[4]
                         if phone_status & 0x01:
-                            details.append("Unlocked")
+                            details.append("Status: Unlocked")
                 except:
                     pass
+
+        # Extract battery information - prioritize this
+        battery_info = None
+        for uuid, data in self.service_data.items():
+            if "180F" in uuid.upper():  # Battery Service
+                try:
+                    if len(data) >= 1:
+                        battery = data[0]
+                        battery_info = f"Battery: {battery}%"
+                except:
+                    pass
+
+        if battery_info:
+            details.append(battery_info)
 
         # Extract service data details
         for uuid, data in self.service_data.items():
@@ -719,14 +751,6 @@ class Device:
                 except:
                     pass
 
-            elif "180F" in uuid.upper():  # Battery Service
-                try:
-                    if len(data) >= 1:
-                        battery = data[0]
-                        details.append(f"Battery: {battery}%")
-                except:
-                    pass
-
             elif "1826" in uuid.upper():  # Fitness Machine Service
                 try:
                     if len(data) >= 2:
@@ -741,25 +765,6 @@ class Device:
             elif "FDCD" in uuid.upper():  # Tile
                 details.append("Tile Tracker")
 
-        # Signal stability
-        stability = self.signal_stability
-        if stability < 2.0:
-            details.append(f"Signal: Stable({stability:.1f})")
-        elif stability < 5.0:
-            details.append(f"Signal: Moderate({stability:.1f})")
-        else:
-            details.append(f"Signal: Unstable({stability:.1f})")
-
-        # Add tx power if available
-        if "180A" in [uuid[-4:].upper() for uuid in self.service_uuids]:
-            # This is an approximation; actual TX power would need connection
-            details.append("Tx Power: Standard")
-
-        # Attempt to extract device firmware/hardware version info
-        if "180A" in [uuid[-4:].upper() for uuid in self.service_uuids]:
-            # Device Information service present
-            details.append("Has Device Info")
-
         # Check for iBeacon data pattern
         for company_id, data in self.manufacturer_data.items():
             if (
@@ -770,17 +775,20 @@ class Device:
             ):
                 # iBeacon format detected
                 try:
-                    # Extract UUID from iBeacon format
-                    uuid_bytes = data[2:18]
-                    uuid_str = "".join(f"{b:02x}" for b in uuid_bytes)
-                    uuid_formatted = f"{uuid_str[:8]}-{uuid_str[8:12]}-{uuid_str[12:16]}-{uuid_str[16:20]}-{uuid_str[20:]}"
-
                     # Extract Major and Minor values
                     major = (data[18] << 8) | data[19]
                     minor = (data[20] << 8) | data[21]
                     details.append(f"iBeacon: {major}.{minor}")
                 except:
                     details.append("iBeacon")
+
+        # Add tx power if available and not already showing battery
+        if (
+            "180A" in [uuid[-4:].upper() for uuid in self.service_uuids]
+            and not battery_info
+        ):
+            # Only show Tx power if we don't have battery info
+            details.append("Tx Power: Standard")
 
         # Add service UUIDs if present
         if self.service_uuids and len(self.service_uuids) > 0:
@@ -797,16 +805,6 @@ class Device:
                 if len(known_services) > 2:
                     services_str += f" +{len(known_services)-2}"
                 details.append(f"Services: {services_str}")
-
-        # Check for specific trackers
-        if self.is_airtag:
-            tracker_type = self.get_tracker_type()
-            if (
-                tracker_type != "Not a tracker"
-                and "Find My Network" not in details
-                and "AirTag" not in details
-            ):
-                details.append(f"Tracker: {tracker_type}")
 
         # Make string from details
         if details:
@@ -1114,6 +1112,7 @@ class Device:
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "is_airtag": self.is_airtag,
+            "is_new": getattr(self, "is_new", False),
             "distance": self.distance,
             "calibrated_n_value": self.calibrated_n_value,
             "calibrated_rssi_at_one_meter": self.calibrated_rssi_at_one_meter,
@@ -1134,6 +1133,7 @@ class Device:
             },
             service_data={k: bytes(v) for k, v in data.get("service_data", {}).items()},
             service_uuids=data.get("service_uuids", []),
+            is_new=data.get("is_new", False),
         )
         device.first_seen = data["first_seen"]
         device.last_seen = data["last_seen"]
@@ -1380,7 +1380,7 @@ class TagFinder:
         )
 
         # Add columns with responsive width settings
-        table.add_column("Name", style="cyan", ratio=4, no_wrap=False)
+        table.add_column("Name", style="cyan", ratio=3, no_wrap=False)
         table.add_column("Type", ratio=2, no_wrap=False)
 
         # Always show MAC address column
@@ -1392,7 +1392,9 @@ class TagFinder:
 
         # Separate RSSI and Signal columns
         table.add_column("RSSI", justify="right", ratio=1)
-        table.add_column("Signal", justify="right", ratio=1)
+        table.add_column(
+            "Signal", justify="right", ratio=2
+        )  # Increased ratio for stability info
         table.add_column("Distance", justify="right", ratio=1)
 
         # Only show seen time column if no device is selected
@@ -1401,9 +1403,9 @@ class TagFinder:
 
         # Always show details but adjust width based on available space
         if self.console.width > 140:
-            table.add_column("Details", ratio=4, no_wrap=False)
+            table.add_column("Details", ratio=5, no_wrap=False)
         else:
-            table.add_column("Details", ratio=3, no_wrap=False)
+            table.add_column("Details", ratio=4, no_wrap=False)
 
         # Sort devices by RSSI (closest first)
         sorted_devices = sorted(devices.values(), key=lambda d: d.rssi, reverse=True)
@@ -1477,8 +1479,21 @@ class TagFinder:
             if isinstance(mac_display, list):
                 mac_display = ":".join(mac_display)
 
-            # Get signal quality as a percentage
-            signal_quality = f"{device.signal_quality:.0f}%"
+                # Get signal quality as a percentage and stability
+            stability = device.signal_stability
+
+            # Format signal with both quality and stability information
+            if stability < 2.0:
+                stability_label = "Stable"
+                stability_suffix = "+"
+            elif stability < 5.0:
+                stability_label = "Moderate"
+                stability_suffix = "~"
+            else:
+                stability_label = "Unstable"
+                stability_suffix = "-"
+
+            signal_quality = f"{device.signal_quality:.0f}% {stability_suffix}"
 
             # Color code signal quality
             if device.signal_quality > 70:
@@ -1488,9 +1503,21 @@ class TagFinder:
             else:
                 signal_color = "red"
 
+            # Create device name display with NEW indicator if needed
+            if getattr(device, "is_new", False):
+                name_display = Text()
+                name_display.append(" NEW ", style="bold yellow on black")
+                name_display.append(
+                    f" {idx_display} {device.name}", style=f"{name_color} {style}"
+                )
+            else:
+                name_display = Text(
+                    f"{idx_display} {device.name}", style=f"{name_color} {style}"
+                )
+
             # Build row data based on which columns are enabled
             row_data = [
-                Text(f"{idx_display} {device.name}", style=f"{name_color} {style}"),
+                name_display,
                 device.device_type,
                 mac_display,  # Add MAC address column
             ]
@@ -1503,7 +1530,10 @@ class TagFinder:
             row_data.extend(
                 [
                     Text(rssi_str, style=f"{rssi_color} {style}"),
-                    Text(signal_quality, style=f"{signal_color} {style}"),
+                    Text(
+                        f"{signal_quality} ({stability_label})",
+                        style=f"{signal_color} {style}",
+                    ),
                     distance,
                 ]
             )
@@ -1626,6 +1656,12 @@ class TagFinder:
         # Create a text object to build up the details panel
         details_text = Text()
         details_text.append("\n")  # Start with a newline for spacing
+
+        # Show NEW badge if this is a newly discovered device
+        if getattr(device, "is_new", False):
+            details_text.append("🆕 ", style="bold yellow")
+            details_text.append("NEWLY DISCOVERED DEVICE", style="bold yellow")
+            details_text.append("\n\n")
 
         # Basic Device Info section
         details_text.append("◉ ", style="bold green")
@@ -2352,8 +2388,18 @@ class TagFinder:
 
     async def discovery_callback(self, device, advertisement_data):
         """Callback for BleakScanner when a device is discovered"""
-        # Check if this is a new device
+        # Check if this is a new device for this scanning session
         is_new_device = device.address not in self.devices
+
+        # Check if this device is in the history
+        known_addresses = set()
+        if self.history:
+            for hist_device in self.history:
+                if isinstance(hist_device, dict) and "address" in hist_device:
+                    known_addresses.add(hist_device["address"])
+
+        # Device is truly new if it's not in our scanning session and not in history
+        is_truly_new = is_new_device and device.address not in known_addresses
 
         if is_new_device:
             # Create new device instance
@@ -2364,6 +2410,7 @@ class TagFinder:
                 manufacturer_data=advertisement_data.manufacturer_data,
                 service_data=advertisement_data.service_data,
                 service_uuids=advertisement_data.service_uuids,
+                is_new=is_truly_new,  # Mark as new if not in history
             )
 
             # Assign a persistent device ID if it doesn't have one yet
