@@ -77,6 +77,7 @@ RSSI_HISTORY_SIZE = 20  # Increased number of RSSI readings to keep for better s
 SCAN_MODE = "active"  # Can be "active" or "passive"
 SCAN_DURATION = 15.0  # Increased duration of each scan in seconds to catch more devices
 DETECTION_THRESHOLD = -95  # Lowered RSSI threshold for detecting more distant devices
+NEW_DEVICE_TIMEOUT = 300  # Time in seconds to display a device as "NEW" (5 minutes)
 SCAN_PARAMETERS = {
     "timeout": 10.0,  # Increased timeout for scanning
     "window": 0x0100,  # Window parameter for scanning
@@ -281,6 +282,11 @@ class Device:
         self.calibrated_rssi_at_one_meter = DEFAULT_RSSI_AT_ONE_METER
         self.is_new = is_new  # Flag to mark if this is a newly discovered device
 
+        # For proximity tracking
+        self.previous_distance = None
+        self.distance_trend = []  # Stores recent distance changes
+        self.last_trend_update = time.time()
+
         # Extract extended information
         self.manufacturer = self._extract_manufacturer()
         self.device_type = self._extract_device_type()
@@ -314,6 +320,10 @@ class Device:
         self.manufacturer = self._extract_manufacturer()
         self.device_type = self._extract_device_type()
         self.device_details = self._extract_detailed_info()
+
+        # Update proximity trend if this device has been tracked before
+        if self.previous_distance is not None:
+            self.update_proximity_trend()
 
     def _extract_manufacturer(self) -> str:
         """Extract manufacturer information from BLE advertisement data"""
@@ -484,34 +494,16 @@ class Device:
         """Extract detailed information from BLE advertisement data"""
         details = []
 
-        # First, check if this is a new device
-        if getattr(self, "is_new", False):
+        # Check if this is a new device AND it's within the timeout period
+        # Only show NEW label for specified timeout period
+        if (
+            getattr(self, "is_new", False)
+            and time.time() - getattr(self, "first_seen", time.time())
+            <= NEW_DEVICE_TIMEOUT
+        ):
             details.append("NEW DEVICE")
 
-        # Next, prioritize critical tracking device information
-        if self.is_airtag:
-            tracker_type = self.get_tracker_type()
-
-            # Add confidence indicator to tracker type
-            confidence_indicators = {
-                TRACKING_CONFIDENCE["CONFIRMED"]: "✅",  # Confirmed
-                TRACKING_CONFIDENCE["HIGH"]: "👍",  # High confidence
-                TRACKING_CONFIDENCE["MEDIUM"]: "🤷‍♂️",  # Medium confidence
-                TRACKING_CONFIDENCE["LOW"]: "👎",  # Low confidence
-                TRACKING_CONFIDENCE["UNLIKELY"]: "",  # Unlikely/No indicator
-            }
-
-            confidence_icon = confidence_indicators.get(self.tracker_confidence, "")
-
-            if (
-                tracker_type != "Not a tracker"
-                and "Find My Network" not in details
-                and "AirTag" not in details
-            ):
-                if self.tracker_confidence <= TRACKING_CONFIDENCE["HIGH"]:
-                    details.append(f"⚠️ {tracker_type} {confidence_icon}")
-                else:
-                    details.append(f"🔍 Possible {tracker_type} {confidence_icon}")
+        # Don't add tracking device info to details anymore - we show this in the Track Prob column
 
         # Parse Apple specific data
         if 76 in self.manufacturer_data:
@@ -1131,8 +1123,106 @@ class Device:
         """Calculate how long this device has been observed"""
         return self.last_seen - self.first_seen
 
+    def update_proximity_trend(self) -> Tuple[str, float]:
+        """Update and return the proximity trend (getting closer or further)
+
+        Returns:
+            Tuple containing the trend direction as a string and the rate of change
+        """
+        current_distance = self.distance
+        current_time = time.time()
+        trend_direction = "stable"
+        change_rate = 0.0
+
+        # Initialize previous distance if not set
+        if self.previous_distance is None:
+            self.previous_distance = current_distance
+            return trend_direction, change_rate
+
+        # Calculate time since last update (minimum 1 second to avoid division by zero)
+        time_diff = max(1.0, current_time - self.last_trend_update)
+
+        # Calculate distance change
+        distance_diff = current_distance - self.previous_distance
+
+        # Calculate rate of change (meters per second)
+        change_rate = distance_diff / time_diff
+
+        # Determine trend direction with dampening to avoid small fluctuations
+        if abs(change_rate) < 0.05:  # Less than 5cm per second is considered stable
+            trend_direction = "stable"
+        elif change_rate < 0:
+            trend_direction = "closer"  # Getting closer (negative rate)
+        else:
+            trend_direction = "further"  # Getting further (positive rate)
+
+        # Add to trend history (keep last 5 updates)
+        self.distance_trend.append(
+            (current_time, current_distance, trend_direction, change_rate)
+        )
+        if len(self.distance_trend) > 5:
+            self.distance_trend.pop(0)
+
+        # Update previous values for next calculation
+        self.previous_distance = current_distance
+        self.last_trend_update = current_time
+
+        return trend_direction, change_rate
+
+    def get_trend_summary(self) -> str:
+        """Get a human-readable summary of the proximity trend"""
+        if not self.distance_trend:
+            return "Monitoring proximity trend..."
+
+        # Get the latest trend
+        _, _, latest_trend, latest_rate = self.distance_trend[-1]
+
+        # Count trends in history to determine consistency
+        trend_counts = {"closer": 0, "further": 0, "stable": 0}
+        for _, _, trend, _ in self.distance_trend:
+            trend_counts[trend] += 1
+
+        # Determine most common trend
+        max_trend = max(trend_counts.items(), key=lambda x: x[1])
+        consistent = max_trend[1] >= 3  # At least 3 of 5 readings show the same trend
+
+        # Format the rate of change
+        rate_abs = abs(latest_rate)
+        if rate_abs < 0.01:
+            rate_text = "very slowly"
+        elif rate_abs < 0.05:
+            rate_text = "slowly"
+        elif rate_abs < 0.2:
+            rate_text = "steadily"
+        elif rate_abs < 0.5:
+            rate_text = "quickly"
+        else:
+            rate_text = "very quickly"
+
+        # Create the message
+        if latest_trend == "stable":
+            return "Distance is stable"
+        elif latest_trend == "closer":
+            confidence = "Consistently" if consistent else "Possibly"
+            return f"{confidence} getting closer {rate_text} ({rate_abs:.2f}m/s)"
+        else:  # further
+            confidence = "Consistently" if consistent else "Possibly"
+            return f"{confidence} moving away {rate_text} ({rate_abs:.2f}m/s)"
+
     def to_dict(self) -> Dict:
         """Convert device to dictionary for storage"""
+        # Convert distance_trend to a serializable format
+        serializable_trend = []
+        for timestamp, distance, trend, rate in getattr(self, "distance_trend", []):
+            serializable_trend.append(
+                {
+                    "timestamp": timestamp,
+                    "distance": distance,
+                    "trend": trend,
+                    "rate": rate,
+                }
+            )
+
         return {
             "address": self.address,
             "name": self.name,
@@ -1153,6 +1243,10 @@ class Device:
             "manufacturer": self.manufacturer,
             "device_type": self.device_type,
             "device_details": self.device_details,
+            # Include proximity tracking data
+            "previous_distance": getattr(self, "previous_distance", None),
+            "distance_trend": serializable_trend,
+            "last_trend_update": getattr(self, "last_trend_update", 0),
         }
 
     @classmethod
@@ -1177,6 +1271,32 @@ class Device:
             device.calibrated_rssi_at_one_meter = data["calibrated_rssi_at_one_meter"]
         if "tracker_confidence" in data:
             device.tracker_confidence = data["tracker_confidence"]
+
+        # Restore proximity tracking data if available
+        if "previous_distance" in data and data["previous_distance"] is not None:
+            device.previous_distance = data["previous_distance"]
+
+        if "last_trend_update" in data:
+            device.last_trend_update = data["last_trend_update"]
+
+        # Restore distance trend history
+        if "distance_trend" in data and isinstance(data["distance_trend"], list):
+            device.distance_trend = []
+            for trend_data in data["distance_trend"]:
+                if isinstance(trend_data, dict):
+                    try:
+                        device.distance_trend.append(
+                            (
+                                trend_data["timestamp"],
+                                trend_data["distance"],
+                                trend_data["trend"],
+                                trend_data["rate"],
+                            )
+                        )
+                    except (KeyError, TypeError):
+                        # Skip malformed entries
+                        continue
+
         return device
 
 
@@ -1274,6 +1394,14 @@ class TagFinder:
                     address = entry["address"]
                     timestamp = entry["last_seen"]
                     key = f"{address}_{timestamp}"
+
+                    # Update is_new flag to respect the NEW_DEVICE_TIMEOUT
+                    # This ensures devices in history don't perpetually show as NEW
+                    if entry.get("is_new", False) and "first_seen" in entry:
+                        # If the device has been known for longer than the timeout, reset the flag
+                        if time.time() - entry["first_seen"] > NEW_DEVICE_TIMEOUT:
+                            entry["is_new"] = False
+
                     unique_entries[key] = entry
                 except (KeyError, TypeError):
                     # Skip malformed entries
@@ -1420,17 +1548,18 @@ class TagFinder:
         table.add_column("Type", ratio=2, no_wrap=False)
 
         # Always show MAC address column
-        table.add_column("MAC", ratio=2, no_wrap=False)
+        table.add_column("MAC", ratio=1, no_wrap=False)
+
+        # Add tracker probability column
+        table.add_column("Track Prob", justify="center", ratio=1)
 
         # Only show manufacturer column if space permits or no device is selected
         if not has_selected or self.console.width > 100:
-            table.add_column("Manufacturer", ratio=2, no_wrap=False)
+            table.add_column("Manufacturer", ratio=1, no_wrap=False)
 
         # Separate RSSI and Signal columns
         table.add_column("RSSI", justify="right", ratio=1)
-        table.add_column(
-            "Signal", justify="right", ratio=2
-        )  # Increased ratio for stability info
+        table.add_column("Signal", justify="right", ratio=1)  # Signal quality info
         table.add_column("Distance", justify="right", ratio=1)
 
         # Only show seen time column if no device is selected
@@ -1579,8 +1708,11 @@ class TagFinder:
             else:
                 signal_color = "red"
 
-            # Create device name display with NEW indicator if needed
-            if getattr(device, "is_new", False):
+            # Create device name display with NEW indicator if needed (only within timeout period)
+            if (
+                getattr(device, "is_new", False)
+                and time.time() - device.first_seen <= NEW_DEVICE_TIMEOUT
+            ):
                 name_display = Text()
                 name_display.append(" NEW ", style="bold yellow on black")
                 name_display.append(
@@ -1602,11 +1734,34 @@ class TagFinder:
                 elif device.tracker_confidence == TRACKING_CONFIDENCE["LOW"]:
                     name_display.append(" ?", style="bold blue")
 
+            # Calculate tracker probability display
+            tracker_prob_display = ""
+            if device.is_airtag:
+                if device.tracker_confidence == TRACKING_CONFIDENCE["CONFIRMED"]:
+                    tracker_prob = "95-100%"
+                    prob_color = "bright_red"
+                elif device.tracker_confidence == TRACKING_CONFIDENCE["HIGH"]:
+                    tracker_prob = "75-95%"
+                    prob_color = "red"
+                elif device.tracker_confidence == TRACKING_CONFIDENCE["MEDIUM"]:
+                    tracker_prob = "50-75%"
+                    prob_color = "yellow"
+                elif device.tracker_confidence == TRACKING_CONFIDENCE["LOW"]:
+                    tracker_prob = "25-50%"
+                    prob_color = "blue"
+                else:
+                    tracker_prob = "< 25%"
+                    prob_color = "blue"
+                tracker_prob_display = Text(tracker_prob, style=f"bold {prob_color}")
+            else:
+                tracker_prob_display = Text("0%", style="dim")
+
             # Build row data based on which columns are enabled
             row_data = [
                 name_display,
                 device.device_type,
-                mac_display,  # Add MAC address column
+                mac_display,
+                tracker_prob_display,  # Add tracker probability
             ]
 
             # Add manufacturer column if it exists
@@ -1618,7 +1773,7 @@ class TagFinder:
                 [
                     Text(rssi_str, style=f"{rssi_color} {style}"),
                     Text(
-                        f"{signal_quality} ({stability_label})",
+                        f"{signal_quality}",  # Simplified signal display
                         style=f"{signal_color} {style}",
                     ),
                     distance,
@@ -1759,11 +1914,17 @@ class TagFinder:
         details_text = Text()
         details_text.append("\n")  # Start with a newline for spacing
 
-        # Show NEW badge if this is a newly discovered device
-        if getattr(device, "is_new", False):
+        # Show NEW badge if this is a newly discovered device AND within timeout period
+        if getattr(device, "is_new", False) and (
+            time.time() - device.first_seen <= NEW_DEVICE_TIMEOUT
+        ):
             details_text.append("🆕 ", style="bold yellow")
             details_text.append("NEWLY DISCOVERED DEVICE", style="bold yellow")
-            details_text.append("\n\n")
+            # Also show when it was first seen
+            details_text.append("\n")
+            time_ago = format_time_ago(time.time() - device.first_seen)
+            details_text.append(f"First seen {time_ago} ago", style="yellow")
+            details_text.append("\n")
 
         # Basic Device Info section
         details_text.append("◉ ", style="bold green")
@@ -1841,7 +2002,7 @@ class TagFinder:
 
         # Distance Estimation section
         details_text.append("\n◉ ", style="bold green")
-        details_text.append("Distance Estimation", style="bold yellow")
+        details_text.append("Distance & Proximity Tracking", style="bold yellow")
         details_text.append("\n")
 
         details_text.append(f"  Estimated Distance: ", style="bold")
@@ -1853,6 +2014,32 @@ class TagFinder:
             "green" if distance < 2 else "yellow" if distance < 5 else "red"
         )
         details_text.append(f"{distance_label}\n", style=distance_style)
+
+        # Add proximity tracking - start tracking if not already tracking
+        if device.previous_distance is None:
+            # Initialize tracking
+            device.previous_distance = device.distance
+            device.last_trend_update = time.time()
+            details_text.append(f"  Proximity Trend: ", style="bold")
+            details_text.append("Initializing tracking...\n", style="yellow")
+        else:
+            # Update trend and display it
+            trend_direction, change_rate = device.update_proximity_trend()
+            trend_summary = device.get_trend_summary()
+
+            details_text.append(f"  Proximity Trend: ", style="bold")
+
+            if trend_direction == "closer":
+                trend_style = "green"
+                trend_icon = "▼"  # Down arrow for getting closer
+            elif trend_direction == "further":
+                trend_style = "red"
+                trend_icon = "▲"  # Up arrow for getting further
+            else:
+                trend_style = "yellow"
+                trend_icon = "◆"  # Diamond for stable
+
+            details_text.append(f"{trend_icon} {trend_summary}\n", style=trend_style)
 
         details_text.append(f"  Calibration Values: ", style="bold")
         details_text.append(
@@ -2260,6 +2447,26 @@ class TagFinder:
         # Create a rich text object for the detailed info
         details_text = Text()
 
+        # Show a special header for new devices
+        is_new = getattr(device, "is_new", False)
+        is_within_timeout = time.time() - device.first_seen <= NEW_DEVICE_TIMEOUT
+
+        if is_new and is_within_timeout:
+            # Add a prominent header for new devices
+            details_text.append("\n")
+            details_text.append("█▓▒░ ", style="bold yellow")
+            details_text.append("NEW DEVICE DETECTED", style="bold yellow")
+            details_text.append(" ░▒▓█", style="bold yellow")
+            details_text.append("\n")
+
+            # Show when the device was first discovered
+            time_since_discovery = time.time() - device.first_seen
+            details_text.append(
+                f"First discovered {format_time_ago(time_since_discovery)} ago",
+                style="yellow",
+            )
+            details_text.append("\n\n")
+
         # Device Identification Section
         details_text.append("\n◉ ", style="bold green")
         details_text.append("Device Identification", style="bold yellow")
@@ -2277,7 +2484,17 @@ class TagFinder:
         details_text.append(f"Manufacturer: ", style="bold")
         details_text.append(f"{device.manufacturer}\n")
 
-        # If it's a tracker, add a warning section with confidence level
+        details_text.append(f"Detection Status: ", style="bold")
+        if is_new:
+            if is_within_timeout:
+                details_text.append("NEWLY DISCOVERED", style="bold yellow")
+            else:
+                details_text.append("Previously discovered", style="blue")
+        else:
+            details_text.append("Previously known", style="blue")
+        details_text.append("\n")
+
+        # Add tracker identification if it's a tracking device
         if device.is_airtag:
             tracker_type = device.get_tracker_type()
 
@@ -2591,15 +2808,44 @@ class TagFinder:
         # Check if this is a new device for this scanning session
         is_new_device = device.address not in self.devices
 
-        # Check if this device is in the history
+        # Check if this device is in the history more thoroughly
         known_addresses = set()
+        known_device_in_history = False
+        similar_name_in_history = False
+
         if self.history:
+            # First, extract all known addresses from history
             for hist_device in self.history:
                 if isinstance(hist_device, dict) and "address" in hist_device:
                     known_addresses.add(hist_device["address"])
 
-        # Device is truly new if it's not in our scanning session and not in history
-        is_truly_new = is_new_device and device.address not in known_addresses
+                    # Check if this exact address is in history
+                    if hist_device["address"] == device.address:
+                        known_device_in_history = True
+
+                    # For thoroughness, also check if a device with same name exists
+                    # This helps with devices that might have randomly changing MAC addresses
+                    if (
+                        device.name
+                        and "name" in hist_device
+                        and device.name == hist_device["name"]
+                    ):
+                        similar_name_in_history = True
+
+        # Device is truly new if:
+        # 1. It's not in our current scanning session
+        # 2. It's not in our history (by address)
+        # 3. There's no device with the same name in our history (extra check)
+        is_truly_new = (
+            is_new_device
+            and not known_device_in_history
+            and not similar_name_in_history
+        )
+
+        # For unnamed devices, be very cautious about marking as new
+        if is_truly_new and (not device.name or device.name == "Unknown"):
+            # Don't mark unnamed devices as new
+            is_truly_new = False
 
         # Check for Find My identifiers to keep weak signals from possible trackers
         might_be_tracker = False
@@ -2678,7 +2924,7 @@ class TagFinder:
                 manufacturer_data=advertisement_data.manufacturer_data,
                 service_data=advertisement_data.service_data,
                 service_uuids=advertisement_data.service_uuids,
-                is_new=is_truly_new,  # Mark as new if not in history
+                is_new=is_truly_new,  # Mark as new only if truly new after thorough checks
             )
 
             # Assign a persistent device ID if it doesn't have one yet
@@ -2686,12 +2932,14 @@ class TagFinder:
                 self.device_ids[device.address] = self.next_device_id
                 self.next_device_id += 1
         else:
+            # When updating an existing device, never set it back to new
             # Update existing device with new data
             self.devices[device.address].update(
                 rssi=enhanced_rssi,  # Use enhanced RSSI
                 manufacturer_data=advertisement_data.manufacturer_data,
                 service_data=advertisement_data.service_data,
                 service_uuids=advertisement_data.service_uuids,
+                is_new=False,  # Ensure it's not marked as new when updating
             )
 
             # Apply adaptive calibration if enabled
@@ -3475,6 +3723,24 @@ class TagFinder:
             )
 
             # Create a settings panel with current settings and status
+            # Add proximity tracking info if there's a selected device
+            proximity_info = ""
+            if self.selected_device and self.selected_device in self.devices:
+                selected_device = self.devices[self.selected_device]
+                if (
+                    hasattr(selected_device, "distance_trend")
+                    and selected_device.distance_trend
+                ):
+                    _, _, trend, rate = selected_device.distance_trend[-1]
+                    if trend == "closer":
+                        proximity_info = (
+                            f"\n[bold]Tracking:[/] [green]▼ Getting closer[/]"
+                        )
+                    elif trend == "further":
+                        proximity_info = f"\n[bold]Tracking:[/] [red]▲ Moving away[/]"
+                    else:
+                        proximity_info = f"\n[bold]Tracking:[/] [yellow]◆ Stable[/]"
+
             settings_panel = Panel(
                 "\n".join(
                     [
@@ -3489,6 +3755,7 @@ class TagFinder:
                         f"[bold]Adapter:[/] {self.current_adapter or 'Default'}",
                         "",
                         f"{selected_info.strip() if selected_info else ''}",
+                        f"{proximity_info if proximity_info else ''}",
                     ]
                 ),
                 title="[bold green]Current Settings[/]",
