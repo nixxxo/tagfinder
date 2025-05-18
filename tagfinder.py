@@ -2205,6 +2205,7 @@ class TagFinder:
         # Only add status column for Linux which has this information
         if sys.platform.startswith("linux"):
             table.add_column("Status", style="yellow")
+            table.add_column("ID", style="cyan")
 
         for i, adapter in enumerate(adapters):
             is_current = (
@@ -2214,11 +2215,13 @@ class TagFinder:
             if sys.platform.startswith("linux"):
                 status = adapter.get("status", "UNKNOWN")
                 status_style = "[bold green]" if status == "UP" else "[bold red]"
+                adapter_id = adapter.get("id", "Unknown")
                 table.add_row(
                     str(i),
                     adapter["address"] or "Unknown",
                     f"{adapter['name']} {is_current}",
                     f"{status_style}{status}[/]",
+                    adapter_id,
                 )
             else:
                 table.add_row(
@@ -2249,12 +2252,18 @@ class TagFinder:
             choice = default_choice
 
         if choice.isdigit() and 0 <= int(choice) < len(adapters):
-            self.current_adapter = adapters[int(choice)]["address"]
+            selected_adapter = adapters[int(choice)]
+            self.current_adapter = selected_adapter["address"]
             self.settings["adapter"] = self.current_adapter
 
             # For Linux, also store the adapter ID (hci0, hci1, etc.) which will be needed later
-            if sys.platform.startswith("linux") and "id" in adapters[int(choice)]:
-                self.settings["adapter_id"] = adapters[int(choice)]["id"]
+            if sys.platform.startswith("linux") and "id" in selected_adapter:
+                self.settings["adapter_id"] = selected_adapter["id"]
+                # Print info about the selected adapter
+                status = selected_adapter.get("status", "UNKNOWN")
+                self.console.print(
+                    f"[bold {'green' if status == 'UP' else 'red'}]Adapter status: {status}[/]"
+                )
 
             self._save_settings()
             self.console.print(
@@ -4153,6 +4162,28 @@ class TagFinder:
                                 ):
                                     # Use the stored adapter_id if available, default to hci0 otherwise
                                     adapter_id = self.settings.get("adapter_id", "hci0")
+
+                                    # First check if adapter is UP
+                                    try:
+                                        check_result = subprocess.run(
+                                            ["hciconfig", adapter_id],
+                                            capture_output=True,
+                                            text=True,
+                                        )
+                                        if "UP RUNNING" not in check_result.stdout:
+                                            self.console.print(
+                                                f"[bold red]Bluetooth adapter {adapter_id} is not UP. Cannot scan with this adapter.[/]"
+                                            )
+                                            # Try to bring the adapter up
+                                            subprocess.run(
+                                                ["sudo", "hciconfig", adapter_id, "up"],
+                                                capture_output=True,
+                                            )
+                                    except Exception as e:
+                                        self.console.print(
+                                            f"[bold red]Error checking adapter status: {e}[/]"
+                                        )
+
                                     self.console.print(
                                         f"[bold yellow]Resetting Bluetooth adapter {adapter_id} to clear stuck operations...[/]"
                                     )
@@ -5438,6 +5469,26 @@ class TagFinder:
                 # Attempt to reset the Bluetooth adapter to clear any stuck operations
                 # Use the stored adapter_id if available
                 adapter_id = self.settings.get("adapter_id", "hci0")
+
+                # First check if adapter is UP
+                try:
+                    check_result = subprocess.run(
+                        ["hciconfig", adapter_id], capture_output=True, text=True
+                    )
+                    if "UP RUNNING" not in check_result.stdout:
+                        self.console.print(
+                            f"[bold red]Bluetooth adapter {adapter_id} is not UP. Attempting to bring it up...[/]"
+                        )
+                        # Try to bring the adapter up
+                        subprocess.run(
+                            ["sudo", "hciconfig", adapter_id, "up"], capture_output=True
+                        )
+                        await asyncio.sleep(1.0)  # Let adapter initialize
+                except Exception as e:
+                    self.console.print(
+                        f"[bold red]Error checking adapter status: {e}[/]"
+                    )
+
                 process = subprocess.run(
                     ["hciconfig", adapter_id, "reset"], capture_output=True
                 )
@@ -6328,24 +6379,62 @@ class TagFinder:
                     adapters.append({"address": address, "name": name})
 
             elif sys.platform.startswith("linux"):
-                # On Linux, we can use hcitool
+                # On Linux, we can use hciconfig to get adapter status
                 import subprocess
 
+                # First get all adapters and their status
                 result = subprocess.run(
-                    ["hcitool", "dev"], capture_output=True, text=True
+                    ["hciconfig", "-a"], capture_output=True, text=True
                 )
                 output = result.stdout
 
+                # Parse hciconfig output to get status information
+                current_adapter = None
+                current_address = None
+                current_name = None
+                current_status = "DOWN"
+
                 for line in output.split("\n"):
-                    if "hci" in line:
-                        parts = line.strip().split("\t")
-                        if len(parts) >= 3:
+                    line = line.strip()
+                    if line.startswith("hci"):
+                        # Save previous adapter if we have one
+                        if current_adapter:
                             adapters.append(
                                 {
-                                    "address": parts[2],
-                                    "name": f"Bluetooth Adapter ({parts[1]})",
+                                    "address": current_address,
+                                    "name": f"Bluetooth Adapter ({current_adapter})",
+                                    "id": current_adapter,
+                                    "status": current_status,
                                 }
                             )
+
+                        # Start new adapter
+                        current_adapter = line.split(":")[0].strip()
+                        current_address = None
+                        current_name = None
+                        current_status = "DOWN"
+
+                    elif "BD Address:" in line:
+                        current_address = (
+                            line.split("BD Address:")[1].split()[0].strip()
+                        )
+
+                    elif "Name:" in line:
+                        current_name = line.split("Name:")[1].split("'")[1].strip()
+
+                    elif "UP RUNNING" in line:
+                        current_status = "UP"
+
+                # Add the last adapter
+                if current_adapter:
+                    adapters.append(
+                        {
+                            "address": current_address,
+                            "name": f"{current_name or 'Bluetooth Adapter'} ({current_adapter})",
+                            "id": current_adapter,
+                            "status": current_status,
+                        }
+                    )
 
             elif sys.platform == "win32":
                 # On Windows, we can use Bleak's internal API
