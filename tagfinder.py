@@ -2189,70 +2189,8 @@ class TagFinder:
         # Clear terminal before showing adapter list
         self.console.clear()
 
-        # Different methods for different platforms
-        adapters = []
-
-        try:
-            if sys.platform == "darwin":  # macOS
-                # On macOS, we can use system_profiler
-                import subprocess
-
-                result = subprocess.run(
-                    ["system_profiler", "SPBluetoothDataType"],
-                    capture_output=True,
-                    text=True,
-                )
-                output = result.stdout
-
-                # Parse the output for Bluetooth controller info
-                if "Bluetooth Controller" in output:
-                    controller_section = output.split("Bluetooth Controller")[1].split(
-                        "\n\n"
-                    )[0]
-                    address = None
-                    name = "Apple Bluetooth"
-
-                    if "Address:" in controller_section:
-                        address_line = [
-                            l for l in controller_section.split("\n") if "Address:" in l
-                        ]
-                        if address_line:
-                            address = address_line[0].split("Address:")[1].strip()
-
-                    adapters.append({"address": address, "name": name})
-
-            elif sys.platform == "linux":
-                # On Linux, we can use hcitool
-                import subprocess
-
-                result = subprocess.run(
-                    ["hcitool", "dev"], capture_output=True, text=True
-                )
-                output = result.stdout
-
-                for line in output.split("\n"):
-                    if "hci" in line:
-                        parts = line.strip().split("\t")
-                        if len(parts) >= 3:
-                            adapters.append(
-                                {
-                                    "address": parts[2],
-                                    "name": f"Bluetooth Adapter ({parts[1]})",
-                                }
-                            )
-
-            elif sys.platform == "win32":
-                # On Windows, we can use Bleak's internal API
-                from bleak.backends.winrt.scanner import BleakScannerWinRT
-
-                scanner = BleakScannerWinRT()
-                await scanner._ensure_adapter()
-                adapters.append(
-                    {"address": "default", "name": "Windows Bluetooth Adapter"}
-                )
-
-        except Exception as e:
-            self.console.print(f"[bold yellow]Error listing adapters: {e}[/]")
+        # Find available adapters
+        adapters = await self._find_available_adapters()
 
         # If no adapters found, add a default one
         if not adapters:
@@ -2264,24 +2202,60 @@ class TagFinder:
         table.add_column("Address", style="green")
         table.add_column("Name", style="magenta")
 
+        # Only add status column for Linux which has this information
+        if sys.platform.startswith("linux"):
+            table.add_column("Status", style="yellow")
+
         for i, adapter in enumerate(adapters):
             is_current = (
                 "[bold green]⟹[/]" if adapter["address"] == self.current_adapter else ""
             )
-            table.add_row(
-                str(i),
-                adapter["address"] or "Unknown",
-                f"{adapter['name']} {is_current}",
-            )
+
+            if sys.platform.startswith("linux"):
+                status = adapter.get("status", "UNKNOWN")
+                status_style = "[bold green]" if status == "UP" else "[bold red]"
+                table.add_row(
+                    str(i),
+                    adapter["address"] or "Unknown",
+                    f"{adapter['name']} {is_current}",
+                    f"{status_style}{status}[/]",
+                )
+            else:
+                table.add_row(
+                    str(i),
+                    adapter["address"] or "Unknown",
+                    f"{adapter['name']} {is_current}",
+                )
 
         self.console.print(table)
 
+        # If on Linux, suggest the first UP adapter
+        default_choice = ""
+        if sys.platform.startswith("linux"):
+            # Find the first UP adapter
+            up_adapters = [i for i, a in enumerate(adapters) if a.get("status") == "UP"]
+            if up_adapters:
+                default_choice = str(up_adapters[0])
+                self.console.print(
+                    f"[bold green]Suggested adapter: {adapters[up_adapters[0]]['name']} (UP)[/]"
+                )
+
         choice = self.console.input(
-            "[bold blue]Select adapter index (or Enter to skip): [/]"
+            f"[bold blue]Select adapter index (or Enter {f'for suggested [{default_choice}]' if default_choice else 'to skip'}): [/]"
         )
+
+        # Use default_choice if user just pressed Enter and a default was suggested
+        if choice == "" and default_choice:
+            choice = default_choice
+
         if choice.isdigit() and 0 <= int(choice) < len(adapters):
             self.current_adapter = adapters[int(choice)]["address"]
             self.settings["adapter"] = self.current_adapter
+
+            # For Linux, also store the adapter ID (hci0, hci1, etc.) which will be needed later
+            if sys.platform.startswith("linux") and "id" in adapters[int(choice)]:
+                self.settings["adapter_id"] = adapters[int(choice)]["id"]
+
             self._save_settings()
             self.console.print(
                 f"[bold green]Selected adapter: {adapters[int(choice)]['name']}[/]"
@@ -4059,6 +4033,10 @@ class TagFinder:
                 "passive": not scan_settings.get("active", SCAN_PARAMETERS["active"]),
             }
 
+            # Use the specific adapter ID that was selected (or default to hci0)
+            adapter_id = self.settings.get("adapter_id", "hci0")
+            scanner_kwargs["adapter"] = adapter_id
+
             # Add required or_patterns for passive scanning
             if scanner_kwargs["scanning_mode"] == "passive":
                 scanner_kwargs["bluez"]["or_patterns"] = or_patterns
@@ -4173,11 +4151,13 @@ class TagFinder:
                                     and "operation already in progress"
                                     in str(self._last_scan_error).lower()
                                 ):
+                                    # Use the stored adapter_id if available, default to hci0 otherwise
+                                    adapter_id = self.settings.get("adapter_id", "hci0")
                                     self.console.print(
-                                        "[bold yellow]Resetting Bluetooth adapter to clear stuck operations...[/]"
+                                        f"[bold yellow]Resetting Bluetooth adapter {adapter_id} to clear stuck operations...[/]"
                                     )
                                     subprocess.run(
-                                        ["hciconfig", "hci0", "reset"],
+                                        ["hciconfig", adapter_id, "reset"],
                                         capture_output=True,
                                     )
                                     await asyncio.sleep(
@@ -5456,8 +5436,10 @@ class TagFinder:
                     "[bold yellow]Cleaning up any existing BLE scan operations...[/]"
                 )
                 # Attempt to reset the Bluetooth adapter to clear any stuck operations
+                # Use the stored adapter_id if available
+                adapter_id = self.settings.get("adapter_id", "hci0")
                 process = subprocess.run(
-                    ["hciconfig", "hci0", "reset"], capture_output=True
+                    ["hciconfig", adapter_id, "reset"], capture_output=True
                 )
                 await asyncio.sleep(1.0)  # Let BlueZ settle after reset
             except Exception as e:
@@ -5465,7 +5447,7 @@ class TagFinder:
                     f"[bold yellow]Failed to reset Bluetooth adapter: {e}[/]"
                 )
                 self.console.print(
-                    "[bold yellow]You may need to manually reset your Bluetooth adapter with 'sudo hciconfig hci0 reset'[/]"
+                    f"[bold yellow]You may need to manually reset your Bluetooth adapter with 'sudo hciconfig {self.settings.get('adapter_id', 'hci0')} reset'[/]"
                 )
                 await asyncio.sleep(1.0)
 
@@ -5980,12 +5962,14 @@ class TagFinder:
                             try:
                                 import subprocess
 
+                                adapter_id = self.settings.get("adapter_id", "hci0")
                                 subprocess.run(
-                                    ["hciconfig", "hci0", "down"], capture_output=True
+                                    ["hciconfig", adapter_id, "down"],
+                                    capture_output=True,
                                 )
                                 await asyncio.sleep(0.5)
                                 subprocess.run(
-                                    ["hciconfig", "hci0", "up"], capture_output=True
+                                    ["hciconfig", adapter_id, "up"], capture_output=True
                                 )
                                 await asyncio.sleep(1.0)
                             except Exception as reset_error:
@@ -5993,7 +5977,7 @@ class TagFinder:
                                     f"[yellow]Failed to reset Bluetooth adapter: {reset_error}[/]"
                                 )
                                 self.console.print(
-                                    "[bold yellow]You may need to manually reset your Bluetooth with 'sudo hciconfig hci0 reset'[/]"
+                                    f"[bold yellow]You may need to manually reset your Bluetooth with 'sudo hciconfig {self.settings.get('adapter_id', 'hci0')} reset'[/]"
                                 )
 
                     # Short pause between range modes
