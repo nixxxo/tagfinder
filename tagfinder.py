@@ -4163,6 +4163,33 @@ class TagFinder:
                     try:
                         # First handle Linux BlueZ backend specifically to avoid InProgress errors
                         if sys.platform.startswith("linux"):
+                            # For Linux, try to clean up any existing BLE scan operations first
+                            try:
+                                import subprocess
+
+                                # Only attempt adapter reset if we're seeing issues
+                                if (
+                                    hasattr(self, "_last_scan_error")
+                                    and "operation already in progress"
+                                    in str(self._last_scan_error).lower()
+                                ):
+                                    self.console.print(
+                                        "[bold yellow]Resetting Bluetooth adapter to clear stuck operations...[/]"
+                                    )
+                                    subprocess.run(
+                                        ["hciconfig", "hci0", "reset"],
+                                        capture_output=True,
+                                    )
+                                    await asyncio.sleep(
+                                        1.0
+                                    )  # Let BlueZ settle after reset
+                                    self._last_scan_error = None  # Clear the error
+                            except Exception as e:
+                                self.console.print(
+                                    f"[yellow]Failed to reset adapter: {e}. Continuing...[/]",
+                                    end="\r",
+                                )
+
                             scanner = None
                             try:
                                 # Perform multi-phase scanning on Linux
@@ -5378,6 +5405,28 @@ class TagFinder:
         original_scan_timeout = SCAN_PARAMETERS["timeout"]
         original_extended_retries = ADVANCED_SCAN_SETTINGS["extended_retries"]
 
+        # For Linux, try to clean up any existing BLE scan operations
+        if sys.platform.startswith("linux"):
+            try:
+                import subprocess
+
+                self.console.print(
+                    "[bold yellow]Cleaning up any existing BLE scan operations...[/]"
+                )
+                # Attempt to reset the Bluetooth adapter to clear any stuck operations
+                process = subprocess.run(
+                    ["hciconfig", "hci0", "reset"], capture_output=True
+                )
+                await asyncio.sleep(1.0)  # Let BlueZ settle after reset
+            except Exception as e:
+                self.console.print(
+                    f"[bold yellow]Failed to reset Bluetooth adapter: {e}[/]"
+                )
+                self.console.print(
+                    "[bold yellow]You may need to manually reset your Bluetooth adapter with 'sudo hciconfig hci0 reset'[/]"
+                )
+                await asyncio.sleep(1.0)
+
         # Create basic or_patterns for passive scanning - required for Linux
         or_patterns = [
             OrPattern(0, AdvertisementDataType.FLAGS, b"\x00"),  # Match any flags
@@ -5554,103 +5603,192 @@ class TagFinder:
                     progress_chars = "⣾⣽⣻⢿⡿⣟⣯⣷"
                     progress_index = 0
 
-                    # Scan with each phase
-                    for phase_idx, phase in enumerate(scan_phases):
+                    # Scan with phase 0 only to prevent operation-in-progress errors
+                    if sys.platform.startswith("linux"):
+                        # On Linux, only use the first phase to avoid BlueZ errors between phases
+                        phase = scan_phases[0]  # Just use first phase
+
                         # Update scanning mode
                         scanner_kwargs["scanning_mode"] = phase["mode"]
 
-                        # For Linux, update bluez parameters when mode changes
-                        if hasattr(
-                            bleak.backends, "bluezdbus"
-                        ) and sys.platform.startswith("linux"):
-                            if "passive" in phase and phase["mode"] == "passive":
-                                # Ensure bluez parameter is set correctly for passive scanning
-                                scanner_kwargs["bluez"]["passive"] = True
-                                # Add required or_patterns for passive scanning
-                                scanner_kwargs["bluez"]["or_patterns"] = or_patterns
-                            else:
-                                # Active scanning
-                                scanner_kwargs["bluez"]["passive"] = False
-
-                            # Update interval if specified in the phase
-                            if "interval" in phase:
-                                scanner_kwargs["bluez"]["interval"] = phase["interval"]
+                        # Update bluez parameters for passive/active scanning
+                        if "passive" in phase and phase["mode"] == "passive":
+                            scanner_kwargs["bluez"]["passive"] = True
+                            scanner_kwargs["bluez"]["or_patterns"] = or_patterns
+                        else:
+                            scanner_kwargs["bluez"]["passive"] = False
 
                         # Create and start scanner
                         scanner = BleakScanner(**scanner_kwargs)
-                        await scanner.start()
+                        try:
+                            await scanner.start()
 
-                        # Scan for duration
-                        start_time = time.time()
-                        while time.time() - start_time < SCAN_DURATION:
-                            # Show progress
-                            progress_index = (progress_index + 1) % len(progress_chars)
+                            # Scan for shorter duration to avoid timeouts
+                            scan_duration = min(SCAN_DURATION, 8.0)  # Limit to 8s max
+                            start_time = time.time()
+
+                            while time.time() - start_time < scan_duration:
+                                # Show progress
+                                progress_index = (progress_index + 1) % len(
+                                    progress_chars
+                                )
+                                self.console.print(
+                                    f"[bold cyan]{progress_chars[progress_index]} Scanning with {phase['description']} ({int(time.time() - start_time)}/{int(scan_duration)}s)[/]",
+                                    end="\r",
+                                )
+                                await asyncio.sleep(0.5)
+
+                            # Stop scanner and allow time to clean up
+                            await scanner.stop()
+                            await asyncio.sleep(1.0)  # Let BlueZ settle
+                            scanner = None  # Force garbage collection
+
+                        except Exception as e:
                             self.console.print(
-                                f"[bold cyan]{progress_chars[progress_index]} Scanning with {phase['description']} ({int(time.time() - start_time)}/{int(SCAN_DURATION)}s)[/]",
-                                end="\r",
+                                f"[bold red]Error during scanning: {e}[/]"
                             )
-                            await asyncio.sleep(0.5)
+                            # Try to clean up
+                            try:
+                                if scanner:
+                                    await scanner.stop()
+                            except:
+                                pass
+                            scanner = None
+                            await asyncio.sleep(2.0)  # Let BlueZ clean up resources
+                    else:
+                        # Non-Linux platforms - use normal multi-phase scanning
+                        for phase_idx, phase in enumerate(scan_phases):
+                            # Update scanning mode
+                            scanner_kwargs["scanning_mode"] = phase["mode"]
 
-                        # Stop scanner
-                        await scanner.stop()
+                            # For Linux, update bluez parameters when mode changes
+                            if hasattr(
+                                bleak.backends, "bluezdbus"
+                            ) and sys.platform.startswith("linux"):
+                                if "passive" in phase and phase["mode"] == "passive":
+                                    # Ensure bluez parameter is set correctly for passive scanning
+                                    scanner_kwargs["bluez"]["passive"] = True
+                                    # Add required or_patterns for passive scanning
+                                    scanner_kwargs["bluez"]["or_patterns"] = or_patterns
+                                else:
+                                    # Active scanning
+                                    scanner_kwargs["bluez"]["passive"] = False
 
-                        # Calculate scan time
-                        scan_time = time.time() - start_time
+                                # Update interval if specified in the phase
+                                if "interval" in phase:
+                                    scanner_kwargs["bluez"]["interval"] = phase[
+                                        "interval"
+                                    ]
 
-                        # Collect results
-                        device_count = len(self.devices)
+                            # Create and start scanner
+                            scanner = BleakScanner(**scanner_kwargs)
+                            await scanner.start()
 
-                        # Calculate maximum distance and average RSSI
-                        max_distance = 0
-                        total_rssi = 0
-                        find_my_count = 0
+                            # Scan for duration
+                            start_time = time.time()
 
-                        for device in self.devices.values():
-                            total_rssi += device.rssi
-                            if device.distance > max_distance:
-                                max_distance = device.distance
-                            if device.is_airtag:
-                                find_my_count += 1
+                            while time.time() - start_time < SCAN_DURATION:
+                                # Show progress
+                                progress_index = (progress_index + 1) % len(
+                                    progress_chars
+                                )
+                                self.console.print(
+                                    f"[bold cyan]{progress_chars[progress_index]} Scanning with {phase['description']} ({int(time.time() - start_time)}/{int(SCAN_DURATION)}s)[/]",
+                                    end="\r",
+                                )
+                                await asyncio.sleep(0.5)
 
-                        avg_rssi = total_rssi / device_count if device_count > 0 else 0
+                            # Stop scanner
+                            await scanner.stop()
+                            await asyncio.sleep(0.5)  # Short pause between phases
 
-                        # Store results for this range mode
-                        mode_result = {
-                            "adapter": adapter_name,
-                            "adapter_address": adapter_address,
-                            "range_mode": range_mode,
-                            "device_count": device_count,
-                            "max_distance": max_distance,
-                            "avg_rssi": avg_rssi,
-                            "find_my_count": find_my_count,
-                            "scan_time": scan_time,
-                        }
+                    # Calculate scan time
+                    scan_time = time.time() - start_time
 
-                        adapter_results.append(mode_result)
-                        all_results.append(mode_result)
+                    # Collect results
+                    device_count = len(self.devices)
 
-                        # Add to results table
-                        results_table.add_row(
-                            adapter_name,
-                            range_mode,
-                            str(device_count),
-                            f"{max_distance:.2f}m",
-                            f"{avg_rssi:.1f} dBm",
-                            str(find_my_count),
-                            f"{scan_time:.1f}s",
-                        )
+                    # Calculate maximum distance and average RSSI
+                    max_distance = 0
+                    total_rssi = 0
+                    find_my_count = 0
 
-                        self.console.print(
-                            f"\n[green]Scan complete: Found {device_count} devices with {adapter_name} in {range_mode} mode[/]"
-                        )
+                    for device in self.devices.values():
+                        total_rssi += device.rssi
+                        if device.distance > max_distance:
+                            max_distance = device.distance
+                        if device.is_airtag:
+                            find_my_count += 1
+
+                    avg_rssi = total_rssi / device_count if device_count > 0 else 0
+
+                    # Store results for this range mode
+                    mode_result = {
+                        "adapter": adapter_name,
+                        "adapter_address": adapter_address,
+                        "range_mode": range_mode,
+                        "device_count": device_count,
+                        "max_distance": max_distance,
+                        "avg_rssi": avg_rssi,
+                        "find_my_count": find_my_count,
+                        "scan_time": scan_time,
+                    }
+
+                    adapter_results.append(mode_result)
+                    all_results.append(mode_result)
+
+                    # Add to results table
+                    results_table.add_row(
+                        adapter_name,
+                        range_mode,
+                        str(device_count),
+                        f"{max_distance:.2f}m",
+                        f"{avg_rssi:.1f} dBm",
+                        str(find_my_count),
+                        f"{scan_time:.1f}s",
+                    )
+
+                    self.console.print(
+                        f"\n[green]Scan complete: Found {device_count} devices with {adapter_name} in {range_mode} mode[/]"
+                    )
 
                 except Exception as e:
+                    err_msg = str(e)
+                    # Store the error for potential automatic recovery during next scan
+                    self._last_scan_error = err_msg
                     self.console.print(
-                        f"[bold red]Error testing adapter {adapter_name} in {range_mode} mode: {e}[/]"
+                        f"[bold red]Error testing adapter {adapter_name} in {range_mode} mode: {err_msg}[/]"
                     )
                     results_table.add_row(
                         adapter_name, range_mode, "Error", "N/A", "N/A", "N/A", "N/A"
                     )
+
+                    # For Linux, check for 'operation already in progress'
+                    if (
+                        sys.platform.startswith("linux")
+                        and "operation already in progress" in err_msg.lower()
+                    ):
+                        self.console.print(
+                            "[yellow]BlueZ operation already in progress. Trying to reset adapter...[/]"
+                        )
+                        try:
+                            import subprocess
+
+                            subprocess.run(
+                                ["hciconfig", "hci0", "down"], capture_output=True
+                            )
+                            await asyncio.sleep(0.5)
+                            subprocess.run(
+                                ["hciconfig", "hci0", "up"], capture_output=True
+                            )
+                            await asyncio.sleep(1.0)
+                        except Exception as reset_error:
+                            self.console.print(
+                                f"[yellow]Failed to reset Bluetooth adapter: {reset_error}[/]"
+                            )
+                            self.console.print(
+                                "[bold yellow]You may need to manually reset your Bluetooth with 'sudo hciconfig hci0 reset'[/]"
+                            )
 
                 # Short pause between range modes
                 await asyncio.sleep(1)
