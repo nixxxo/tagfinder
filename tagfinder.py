@@ -248,13 +248,100 @@ TRACKING_DEVICE_TYPES = {
 # Add more confidence levels to tracker detection
 TRACKING_CONFIDENCE = {"CONFIRMED": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNLIKELY": 4}
 
-# Add detection patterns for Apple Find My network
+# Updated FindMy data patterns based on Adam Catley's research
 FIND_MY_DATA_PATTERNS = [
     {"offset": 0, "value": 0x12, "mask": 0xFF},  # First byte 0x12
     {"offset": 1, "value": 0x19, "mask": 0xFF},  # Second byte 0x19
     {"offset": 0, "value": 0x10, "mask": 0xFF},  # First byte 0x10 (alternate pattern)
-    {"offset": 0, "value": 0x0F, "mask": 0xFF},  # First byte 0x0F (another pattern)
+    {"offset": 0, "value": 0x0F, "mask": 0xFF},  # First byte 0x0F (Nearby interaction)
+    {"offset": 0, "value": 0x07, "mask": 0xFF},  # AirPods pattern / Unregistered Airtag
+    {"offset": 0, "value": 0x01, "mask": 0xFF},  # Another AirPods pattern
+    {"offset": 0, "value": 0x0C, "mask": 0xFF},  # iPhone/iPad pattern
 ]
+
+# Add specific AirTag status bits patterns for detection
+AIRTAG_STATUS_BITS = {
+    0x01: "Separated from owner",
+    0x02: "Play Sound",
+    0x04: "Lost Mode",
+}
+
+# Add AirTag status byte battery level indicators
+AIRTAG_BATTERY_STATUS = {
+    0x10: "Battery Full",  # Status byte 0x10 when battery is full
+    0x50: "Battery Medium",  # Status byte 0x50 when battery is medium
+    0x90: "Battery Low",  # Status byte 0x90 when battery is low
+    0xD0: "Battery Very Low",  # Status byte 0xD0 when battery is very low
+}
+
+# AirTag advertisement format details
+AIRTAG_ADV_FORMAT = {
+    "adv_data_length": 0x1E,  # Advertising data length: 31 (maximum allowed)
+    "adv_data_type": 0xFF,  # Advertising data type: Manufacturer Specific Data
+    "company_id": 0x004C,  # Apple's company identifier (2 bytes: 0x004C)
+    "registered_payload_type": 0x12,  # Apple payload type for FindMy network broadcast
+    "unregistered_payload_type": 0x07,  # Apple payload type for unregistered device
+    "payload_length": 0x19,  # Apple payload length (31 - 6 = 25 = 0x19)
+    "status_byte_offset": 6,  # Status byte position in advertisement data
+    "public_key_offset": 7,  # Start of EC P-224 public key
+    "public_key_length": 23,  # Length of public key in advertisement
+    "crypto_counter_offset": 31,  # Position of crypto counter (changes every 15min)
+}
+
+# Daily update timing for AirTag
+AIRTAG_UPDATE_TIMES = {
+    "public_key": "04:00am",  # Updates BLE address and public key once a day at 04:00am
+    "advertisement_data": 15
+    * 60,  # Updates last byte of advertisement data every 15 minutes
+}
+
+# AirTag sleep/wake timing
+AIRTAG_TIMING = {
+    "lost_mode_trigger": 3
+    * 24
+    * 60
+    * 60,  # Goes into lost mode exactly 3 days after separation
+    "sound_alert_interval": 6
+    * 60
+    * 60,  # Makes noise once every 6 hours in lost mode with movement
+    "accelerometer_idle_sample": 10,  # Samples accelerometer every 10 seconds when waiting for movement
+    "accelerometer_active_sample": 0.5,  # Samples accelerometer every 0.5 seconds after motion
+    "accelerometer_active_duration": 20,  # Samples accelerometer for 20 seconds after motion detected
+    "advertisement_interval": 2,  # Transmits BLE advertisement every 2 seconds when away from owner
+    "unregistered_adv_interval": 0.033,  # Unregistered AirTag advertises every 33ms
+    "connection_interval": 1,  # BLE connection interval of 1 second when near owner
+}
+
+# AirTag specific power profiles
+AIRTAG_POWER = {
+    "sleep_current": 2.3,  # µA (microamps)
+    "min_voltage": 1.9,  # Volts (minimum to boot)
+    "advertisement_current": 6.0,  # mA during advertisement
+    "accelerometer_sample_current": 0.4,  # mA during accelerometer wakeup
+}
+
+# Add Apple-specific apple advertisement data structures
+APPLE_ADV_TYPES = {
+    0x01: "iBeacon",
+    0x05: "AirDrop",
+    0x07: "Unregistered AirTag/FindMy",
+    0x09: "HomeKit",
+    0x0A: "AirTag/Find My",
+    0x0C: "Handoff",
+    0x0F: "Nearby",
+    0x10: "Nearby Action/Find My",
+    0x12: "Find My",
+}
+
+# Add specific byte positions for AirTag status in manufacturer data
+AIRTAG_BYTE_POSITIONS = {
+    "status": 5,  # Status byte position in manufacturer data for AirTag status
+    "type": 2,  # Type byte position (0x0A for AirTag)
+    "protocol": [0, 1],  # Protocol identifier bytes (0x12, 0x19)
+    "battery_status": 6,  # Position of status byte that contains battery level
+    "public_key": [7, 29],  # Range of bytes for the public key (inclusive)
+    "crypto_counter": 31,  # Crypto counter byte (changes every 15 minutes)
+}
 
 
 class Device:
@@ -301,17 +388,74 @@ class Device:
         service_uuids: Optional[List] = None,
         is_new: Optional[bool] = None,
     ):
+        # Store previous advertisement time for calculating interval
+        # (Used for AirTag detection based on Adam Catley's research on 2s advertisement interval)
+        self.previous_seen = getattr(self, "last_seen", time.time())
+
+        # Store previous manufacturer data to detect changes
+        if 76 in self.manufacturer_data:  # Apple's company identifier
+            # Store previous data before updating
+            if not hasattr(self, "prev_manufacturer_data"):
+                self.prev_manufacturer_data = {}
+            self.prev_manufacturer_data[76] = bytes(self.manufacturer_data[76])
+
         self.rssi = rssi
         self.rssi_history.append(rssi)
+
+        # Check for manufacturer data changes (for detecting AirTag 15-minute update cycle)
         if manufacturer_data:
+            # Check for changes in Apple's manufacturer data
+            if (
+                76 in manufacturer_data
+                and hasattr(self, "prev_manufacturer_data")
+                and 76 in self.prev_manufacturer_data
+            ):
+                # Compare data to detect changes in advertisement
+                if bytes(manufacturer_data[76]) != self.prev_manufacturer_data[76]:
+                    # Record time of change and update counter
+                    current_time = time.time()
+                    self.last_adv_change_time = current_time
+
+                    # Calculate time since last change if available
+                    if hasattr(self, "prev_adv_change_time"):
+                        change_interval = current_time - self.prev_adv_change_time
+                        # Check if this matches the 15-minute cycle from Adam's research
+                        if 840 <= change_interval <= 960:  # 14-16 minutes in seconds
+                            self.matches_airtag_timing = True
+                        self.adv_change_interval = change_interval
+
+                    # Update change history
+                    self.prev_adv_change_time = current_time
+                    self.adv_changes = getattr(self, "adv_changes", 0) + 1
+
+            # Now update the actual data
             self.manufacturer_data = manufacturer_data
+
         if service_data:
             self.service_data = service_data
         if service_uuids:
             self.service_uuids = service_uuids
         if is_new is not None:
             self.is_new = is_new
+
         self.last_seen = time.time()
+
+        # Calculate advertisement interval (Adam's research says AirTags use ~2s when separated)
+        self.adv_interval = self.last_seen - self.previous_seen
+        # Build up history of intervals to detect consistent patterns
+        if not hasattr(self, "adv_interval_history"):
+            self.adv_interval_history = deque(maxlen=10)
+        self.adv_interval_history.append(self.adv_interval)
+
+        # Analyze if device shows consistent ~2s advertisement interval like AirTags
+        if len(self.adv_interval_history) >= 5:
+            # Calculate average and standard deviation
+            avg_interval = sum(self.adv_interval_history) / len(
+                self.adv_interval_history
+            )
+            # Check if average is close to AirTag's expected 2s and relatively stable
+            if 1.8 <= avg_interval <= 2.2:
+                self.consistent_airtag_interval = True
 
         # Recalculate tracker detection with new data
         self.is_airtag = self._check_if_airtag()
@@ -510,20 +654,95 @@ class Device:
         if 76 in self.manufacturer_data:
             apple_data = self.manufacturer_data[76]
 
-            # Try to extract Apple model details
+            # Try to extract Apple model details based on Adam Catley's AirTag research
             if len(apple_data) > 5:
                 try:
-                    # AirTag and Find My protocol specifics
+                    # AirTag protocol detection
+                    # Registered AirTag/Find My protocol (0x12, 0x19)
                     if apple_data[0] == 0x12 and apple_data[1] == 0x19:
                         details.append("Find My Network")
+                    # Unregistered AirTag detection (0x07, 0x19) per new research
+                    elif apple_data[0] == 0x07 and apple_data[1] == 0x19:
+                        details.append("Unregistered AirTag")
 
-                        # Try to extract AirTag status bits if available
+                        # Check for AirTag specific identifiers
+                        if len(apple_data) > 3 and apple_data[2] & 0x0F == 0x0A:
+                            details.append("AirTag")
+
+                        # Track advertisement data changes - might indicate 15 minute update cycle
+                        if hasattr(self, "last_advertisement_data"):
+                            if (
+                                self.manufacturer_data[76]
+                                != self.last_advertisement_data
+                            ):
+                                self.advertisement_changed_at = time.time()
+                                self.advertisement_changes = (
+                                    getattr(self, "advertisement_changes", 0) + 1
+                                )
+                        # Store current data for next comparison
+                        self.last_advertisement_data = bytes(self.manufacturer_data[76])
+
+                        # Try to extract AirTag status bits if available (position 5 according to Adam's research)
                         if len(apple_data) >= 6:
                             status_byte = apple_data[5]
+                            status_details = []
+
                             if status_byte & 0x01:
-                                details.append("Separated")
+                                status_details.append("Separated")
                             if status_byte & 0x02:
-                                details.append("Play Sound")
+                                status_details.append("Play Sound")
+                            if status_byte & 0x04:
+                                status_details.append("Lost Mode")
+
+                            # Add status bits information
+                            if status_details:
+                                details.append(" | ".join(status_details))
+
+                            # Add status byte for advanced users if non-zero
+                            if status_byte > 0:
+                                details.append(f"Status: 0x{status_byte:02X}")
+
+                        # Check for battery status at position 6 (per new research)
+                        if len(apple_data) >= 7:
+                            battery_status_byte = apple_data[6]
+                            battery_value = battery_status_byte & 0xF0
+
+                            # Check against known battery status values from new research
+                            if battery_value == 0x10:
+                                details.append("Battery Full")
+                            elif battery_value == 0x50:
+                                details.append("Battery Medium")
+                            elif battery_value == 0x90:
+                                details.append("Battery Low")
+                            elif battery_value == 0xD0:
+                                details.append("Battery Very Low")
+
+                        # Check for crypto counter (position 31) which changes every 15 minutes
+                        if len(apple_data) >= 32:
+                            # Store the crypto counter for change detection
+                            if not hasattr(self, "crypto_counter"):
+                                self.crypto_counter = apple_data[31]
+                                self.crypto_counter_time = time.time()
+                            elif self.crypto_counter != apple_data[31]:
+                                # Calculate time since last change
+                                time_diff = time.time() - self.crypto_counter_time
+                                # Check if it's around 15 minutes (14-16 min range)
+                                if 840 <= time_diff <= 960:
+                                    details.append("15min Counter Change")
+                                    self.crypto_counter_matches = True
+                                # Update for next check
+                                self.crypto_counter = apple_data[31]
+                                self.crypto_counter_time = time.time()
+
+                            # Show the crypto counter value (helpful for tracking changes)
+                            details.append(f"Counter: 0x{apple_data[31]:02X}")
+
+                        # Add timing information if we have it
+                        if (
+                            hasattr(self, "advertisement_changes")
+                            and self.advertisement_changes > 0
+                        ):
+                            details.append(f"Adv Changes: {self.advertisement_changes}")
 
                     # AirPods battery levels
                     elif len(apple_data) >= 13 and (
@@ -570,7 +789,7 @@ class Device:
                         if watch_battery <= 10:
                             details.append(f"Battery: {watch_battery*10}%")
 
-                    # iPhone/iPad info
+                        # iPhone/iPad info
                     elif apple_data[0] == 0x0C and len(apple_data) >= 5:
                         phone_status = apple_data[4]
                         if phone_status & 0x01:
@@ -671,7 +890,8 @@ class Device:
         return ""
 
     def _check_if_airtag(self) -> bool:
-        """Check if device is potentially an AirTag or other tracking device with enhanced detection"""
+        """Check if device is potentially an AirTag or other tracking device with enhanced detection based on
+        Adam Catley's research on AirTag reverse engineering"""
         # Store verification flags with confidence levels
         evidence = {
             "name_match": False,
@@ -681,6 +901,11 @@ class Device:
             "known_uuid": False,
             "service_data": False,
             "nearby_interaction": False,
+            "status_bits": False,
+            "advertisement_interval": False,
+            "daily_advertisement_update": False,
+            "unregistered_airtag": False,  # New flag for unregistered AirTags
+            "battery_status": False,  # New flag for battery status detection
         }
 
         # Check manufacturer first - must be Apple for AirTags
@@ -700,19 +925,76 @@ class Device:
 
                     if offset < len(data) and (data[offset] & mask) == value:
                         evidence["find_my_pattern"] = True
+
+                        # Also store the Apple advertisement type for further analysis
+                        if offset == 0:
+                            if data[0] in APPLE_ADV_TYPES:
+                                self.apple_adv_type = APPLE_ADV_TYPES[data[0]]
+                            else:
+                                self.apple_adv_type = (
+                                    f"Unknown Apple Type: {data[0]:02X}"
+                                )
                         break
 
-                # Exact Find My network pattern (highest confidence)
+                # Exact Find My network pattern (highest confidence) - Registered AirTag
                 if len(data) > 1 and data[0] == 0x12 and data[1] == 0x19:
                     evidence["find_my_pattern"] = True
 
-                    # Exact AirTag identifier pattern
-                    if len(data) > 3 and data[2] & 0x0F == 0x0A:  # AirTag type is 0x0A
+                    # Exact AirTag identifier pattern - AirTag type is 0x0A
+                    # According to Adam Catley's research, this is a definitive AirTag marker
+                    if len(data) > 3 and data[2] & 0x0F == 0x0A:
                         evidence["airtag_pattern"] = True
+
+                    # Check for AirTag status bits if we have enough data
+                    # Adam's research shows status byte at position 5
+                    if len(data) >= 6:
+                        status_byte = data[5]
+                        # Store the AirTag status bits for display and analysis
+                        self.airtag_status = {}
+                        for bit, meaning in AIRTAG_STATUS_BITS.items():
+                            if status_byte & bit:
+                                self.airtag_status[bit] = meaning
+                                evidence["status_bits"] = True
+
+                    # Check for battery status in status byte at position 6
+                    if len(data) >= 7:
+                        battery_byte = data[6] & 0xF0
+                        if battery_byte in [0x10, 0x50, 0x90, 0xD0]:
+                            evidence["battery_status"] = True
+                            if battery_byte == 0x10:
+                                self.battery_status = "Battery Full"
+                            elif battery_byte == 0x50:
+                                self.battery_status = "Battery Medium"
+                            elif battery_byte == 0x90:
+                                self.battery_status = "Battery Low"
+                            elif battery_byte == 0xD0:
+                                self.battery_status = "Battery Very Low"
+
+                # Check for Unregistered AirTag pattern (type 0x07)
+                # According to new research, unregistered AirTags use this pattern
+                if len(data) > 1 and data[0] == 0x07 and data[1] == 0x19:
+                    evidence["unregistered_airtag"] = True
+                    # Store the information for later use
+                    self.unregistered_airtag = True
+                    # This is a stronger evidence than just a generic "find_my_pattern"
+                    # as it specifically identifies an unregistered AirTag
 
                 # Check for Nearby Interaction protocol (also used by Find My)
                 if len(data) > 2 and data[0] == 0x0F:
                     evidence["nearby_interaction"] = True
+
+        # Check for specific status update timing patterns
+        # According to Adam's research, AirTags update advertisement data every 15 minutes
+        # This is harder to detect in a single scan, but we can look for consistent advertisement
+        # interval around 2 seconds as mentioned in Adam's research
+        if hasattr(self, "last_seen") and getattr(self, "previous_seen", None):
+            adv_interval = self.last_seen - self.previous_seen
+            # Registered AirTags advertise approximately every 2 seconds when away from owner
+            if 1.5 <= adv_interval <= 2.5:
+                evidence["advertisement_interval"] = True
+            # Unregistered AirTags advertise much more frequently (~33ms)
+            elif 0.02 <= adv_interval <= 0.05:
+                evidence["unregistered_airtag"] = True
 
         # If name contains clear AirTag identifiers
         if self.name and any(
@@ -726,26 +1008,52 @@ class Device:
             for find_my_id in FIND_MY_UUIDS:
                 if find_my_id in uuid_upper:
                     evidence["known_uuid"] = True
+                    # Store the matching Find My UUID for further analysis
+                    self.find_my_uuid = uuid
                     break
 
         # Check for specific service data patterns related to Find My network
-        for service_uuid, _ in self.service_data.items():
+        for service_uuid, data in self.service_data.items():
             service_uuid_upper = service_uuid.upper()
             if any(find_my_id in service_uuid_upper for find_my_id in FIND_MY_UUIDS):
                 evidence["service_data"] = True
+                # Store the service data for further analysis
+                self.find_my_service_data = data.hex() if data else ""
                 break
 
-        # Apply decision rules for classification:
+        # Apply decision rules for classification based on Adam Catley's research:
 
-        # Definite AirTag/Find My device (extremely high confidence)
+        # Definite AirTag (extremely high confidence)
         if (
-            (evidence["apple_manufacturer"] and evidence["find_my_pattern"])
-            or (evidence["apple_manufacturer"] and evidence["airtag_pattern"])
+            # AirTag specific pattern mentioned in Adam's research - highest confidence
+            (evidence["apple_manufacturer"] and evidence["airtag_pattern"])
+            # Unregistered AirTag pattern
+            or (evidence["apple_manufacturer"] and evidence["unregistered_airtag"])
+            # Find My pattern with status bits is very high confidence
             or (
                 evidence["apple_manufacturer"]
-                and evidence["known_uuid"]
-                and evidence["name_match"]
+                and evidence["find_my_pattern"]
+                and evidence["status_bits"]
             )
+            # AirTag based on multiple high confidence indicators
+            or (
+                evidence["apple_manufacturer"]
+                and evidence["find_my_pattern"]
+                and evidence["known_uuid"]
+            )
+            # AirTag with battery status indicators
+            or (
+                evidence["apple_manufacturer"]
+                and evidence["find_my_pattern"]
+                and evidence["battery_status"]
+            )
+            # AirTag with correct advertisement interval timings per Adam's research
+            or (
+                evidence["apple_manufacturer"]
+                and evidence["find_my_pattern"]
+                and evidence["advertisement_interval"]
+            )
+            # Old but reliable pattern according to Adam's research
             or (
                 evidence["apple_manufacturer"]
                 and evidence["nearby_interaction"]
@@ -754,9 +1062,10 @@ class Device:
         ):
             return True
 
-        # High confidence Find My device
+        # High confidence Find My device (not necessarily an AirTag)
         if (
-            (evidence["apple_manufacturer"] and evidence["known_uuid"])
+            (evidence["apple_manufacturer"] and evidence["find_my_pattern"])
+            or (evidence["apple_manufacturer"] and evidence["known_uuid"])
             or (evidence["apple_manufacturer"] and evidence["service_data"])
             or (evidence["name_match"] and evidence["known_uuid"])
         ):
@@ -787,7 +1096,8 @@ class Device:
         return False
 
     def _calculate_tracker_confidence(self) -> int:
-        """Calculate confidence level for tracker detection (0 = confirmed, 4 = unlikely)"""
+        """Calculate confidence level for tracker detection (0 = confirmed, 4 = unlikely)
+        based on Adam Catley's AirTag research"""
         if not self.is_airtag:
             return TRACKING_CONFIDENCE["UNLIKELY"]
 
@@ -801,16 +1111,36 @@ class Device:
             # Check for Find My pattern in manufacturer data
             data = self.manufacturer_data[76]
             if len(data) > 1:
-                if data[0] == 0x12 and data[1] == 0x19:  # Classic Find My pattern
+                # Classic Find My pattern from Adam Catley's research (0x12, 0x19)
+                if data[0] == 0x12 and data[1] == 0x19:
                     evidence_points += 3
 
-                # AirTag specific pattern
+                # AirTag specific pattern (type byte is 0x0A) - strongest evidence according to research
                 if len(data) > 2 and data[2] & 0x0F == 0x0A:
-                    evidence_points += 4
+                    evidence_points += (
+                        5  # Increased due to high confidence based on research
+                    )
 
-                # Other Apple Find My patterns
-                if data[0] == 0x10 or data[0] == 0x0F:
+                # Check for status bits - strong evidence for AirTag
+                if len(data) >= 6:
+                    status_byte = data[5]
+                    # If any status bits are set that match known AirTag states
+                    if status_byte & 0x01:  # Separated from owner
+                        evidence_points += 4
+                    if status_byte & 0x02:  # Play Sound
+                        evidence_points += 4
+                    if status_byte & 0x04:  # Lost Mode
+                        evidence_points += 4
+
+                # Other Apple Find My patterns identified in Adam's research
+                if data[0] == 0x10:  # Nearby Action/Find My
+                    evidence_points += 3
+                elif data[0] == 0x0F:  # Nearby Interaction
                     evidence_points += 2
+                elif data[0] == 0x07 or data[0] == 0x01:  # AirPods patterns
+                    evidence_points += (
+                        1  # Lower points as these are not tracker-specific
+                    )
 
         # Check name for AirTag indicators
         if self.name and any(
@@ -823,7 +1153,16 @@ class Device:
             uuid_upper = uuid.upper()
             for find_my_id in FIND_MY_UUIDS:
                 if find_my_id in uuid_upper:
-                    evidence_points += 2
+                    # Higher points for more specific Find My UUIDs identified by Adam
+                    if any(
+                        specific_id in uuid_upper
+                        for specific_id in ["7DFC9000", "7DFC9001"]
+                    ):
+                        evidence_points += (
+                            3  # Higher confidence for specific AirTag UUIDs
+                        )
+                    else:
+                        evidence_points += 2
                     break
 
         # Check for Find My service data
@@ -833,12 +1172,33 @@ class Device:
                 evidence_points += 2
                 break
 
-        # Determine confidence level based on evidence points
-        if evidence_points >= 7:
+        # Check consistent advertisement timing if data available
+        if hasattr(self, "last_seen") and getattr(self, "previous_seen", None):
+            adv_interval = self.last_seen - self.previous_seen
+            # According to Adam's research, AirTags advertise every ~2 seconds when separated
+            if 1.8 <= adv_interval <= 2.2:
+                evidence_points += 2
+
+        # Check AirTag power states if data is available
+        if hasattr(self, "rssi_history") and len(self.rssi_history) >= 5:
+            # Look for patterns of consistent signal that match AirTag advertisement pattern
+            # AirTags advertise every 2 seconds with relatively stable power
+            rssi_diffs = [
+                abs(self.rssi_history[i] - self.rssi_history[i - 1])
+                for i in range(1, len(self.rssi_history))
+            ]
+            avg_diff = sum(rssi_diffs) / len(rssi_diffs)
+            if (
+                avg_diff < 5
+            ):  # Stable RSSI indicates fixed location and consistent transmission
+                evidence_points += 1
+
+        # Determine confidence level based on evidence points - thresholds adjusted based on research
+        if evidence_points >= 9:  # Increased for definitive identification
             return TRACKING_CONFIDENCE["CONFIRMED"]
-        elif evidence_points >= 5:
+        elif evidence_points >= 6:  # Adjusted for high confidence
             return TRACKING_CONFIDENCE["HIGH"]
-        elif evidence_points >= 3:
+        elif evidence_points >= 4:  # Adjusted for medium confidence
             return TRACKING_CONFIDENCE["MEDIUM"]
         elif evidence_points >= 1:
             return TRACKING_CONFIDENCE["LOW"]
@@ -846,40 +1206,112 @@ class Device:
             return TRACKING_CONFIDENCE["UNLIKELY"]
 
     def get_tracker_type(self) -> str:
-        """Identify the specific type of tracking device"""
+        """Identify the specific type of tracking device based on Adam Catley's AirTag research"""
         if not self.is_airtag:
             return "Not a tracker"
 
         # --- AirTag Identification (High Confidence) ---
         if self.manufacturer == "Apple":
-            # Definitive AirTag signal from manufacturer data
+            # Definitive AirTag signal with type byte 0x0A as documented by Adam Catley
             if 76 in self.manufacturer_data and len(self.manufacturer_data[76]) > 2:
+                data = self.manufacturer_data[76]
+
+                # Check for specific AirTag type byte (0x0A)
+                if len(data) > 3 and data[2] & 0x0F == 0x0A:
+                    # Check if we've observed timing characteristics of AirTags
+                    if (
+                        hasattr(self, "consistent_airtag_interval")
+                        and self.consistent_airtag_interval
+                    ):
+                        return "Apple AirTag (Verified)"
+                    else:
+                        return "Apple AirTag"
+
+                # Check for exact FindMy protocol with status bits that match AirTag
                 if (
-                    len(self.manufacturer_data[76]) > 3
-                    and self.manufacturer_data[76][2] & 0x0F == 0x0A
-                ):
-                    return "Apple AirTag"
+                    len(data) > 5
+                    and data[0] == 0x12
+                    and data[1] == 0x19
+                    and data[5] & 0x07
+                ):  # Check if any status bits are set
+
+                    # Check status byte for AirTag-specific bits identified by Adam
+                    status_bits = []
+                    if data[5] & 0x01:
+                        status_bits.append("Separated")
+                    if data[5] & 0x02:
+                        status_bits.append("Play Sound")
+                    if data[5] & 0x04:
+                        status_bits.append("Lost Mode")
+
+                    if status_bits:
+                        return f"Apple AirTag ({', '.join(status_bits)})"
+
+                # Unregistered AirTag pattern - type 0x07, 0x19 as per new research
+                if data[0] == 0x07 and data[1] == 0x19:
+                    return "Unregistered Apple AirTag"
+
+                # Find My pattern but no specific AirTag identifier - type 0x12, 0x19
+                if data[0] == 0x12 and data[1] == 0x19:
+                    # Check for battery status indicator to improve confidence
+                    if hasattr(self, "battery_status"):
+                        return f"Apple AirTag ({self.battery_status})"
+
+                    # Check timing characteristics unique to AirTags according to Adam
+                    if (
+                        hasattr(self, "consistent_airtag_interval")
+                        and self.consistent_airtag_interval
+                    ):
+                        return "Likely Apple AirTag"
+                    elif (
+                        hasattr(self, "matches_airtag_timing")
+                        and self.matches_airtag_timing
+                    ):
+                        return "Likely Apple AirTag"
+                    elif (
+                        hasattr(self, "crypto_counter_matches")
+                        and self.crypto_counter_matches
+                    ):
+                        return "Likely Apple AirTag (15min cycle)"
+                    else:
+                        return "Apple Find My Device"
+
+                # Nearby Interaction protocol (0x0F) with confident timing
+                if data[0] == 0x0F and hasattr(self, "consistent_airtag_interval"):
+                    return "Likely Apple AirTag"
 
             # Clear name match
             if self.name and "airtag" in self.name.lower():
                 return "Apple AirTag"
 
-            # Find My network protocol without specific AirTag identifier
-            if 76 in self.manufacturer_data and len(self.manufacturer_data[76]) >= 2:
-                if (
-                    self.manufacturer_data[76][0] == 0x12
-                    and self.manufacturer_data[76][1] == 0x19
+            # Check for Find My Network specific UUIDs identified by Adam Catley
+            for uuid in self.service_uuids:
+                uuid_upper = uuid.upper()
+                # More specific UUIDs that are strongly associated with AirTags
+                if any(
+                    find_my_id in uuid_upper for find_my_id in ["7DFC9000", "7DFC9001"]
                 ):
-                    # Find My protocol but not specifically AirTag
+                    return "Apple AirTag"
+                # General Find My network UUIDs
+                elif any(
+                    find_my_id in uuid_upper for find_my_id in ["0000FD44", "74278BDA"]
+                ):
                     return "Apple Find My Device"
 
-            # Check for Find My Network specific UUIDs
-            for uuid in self.service_uuids:
-                if any(
-                    find_my_id in uuid.upper()
-                    for find_my_id in ["7DFC9000", "7DFC9001", "0000FD44"]
-                ):
-                    return "Apple Find My Device"
+            # Check for advertisement interval pattern (2s) specific to AirTags (Adam's research)
+            if (
+                hasattr(self, "adv_interval_history")
+                and len(self.adv_interval_history) >= 5
+            ):
+                avg_interval = sum(self.adv_interval_history) / len(
+                    self.adv_interval_history
+                )
+                if 1.8 <= avg_interval <= 2.2:
+                    return "Likely Apple AirTag"
+
+            # Check for 15-minute advertisement data update pattern described by Adam
+            if hasattr(self, "matches_airtag_timing") and self.matches_airtag_timing:
+                return "Likely Apple AirTag"
 
             # Other Apple device that uses Find My network
             return "Apple Find My Device"
@@ -1380,7 +1812,7 @@ class Device:
                 return "You're moving parallel to the device. Try changing direction."
 
     def to_dict(self) -> Dict:
-        """Convert device to dictionary for storage"""
+        """Convert device to dictionary for storage including AirTag detection properties"""
         # Convert distance_trend to a serializable format
         serializable_trend = []
         for timestamp, distance, trend, rate in getattr(self, "distance_trend", []):
@@ -1393,7 +1825,11 @@ class Device:
                 }
             )
 
-        return {
+        # Convert advertisement interval history to serializable format
+        adv_interval_history = list(getattr(self, "adv_interval_history", []))
+
+        # Basic device data
+        result = {
             "address": self.address,
             "name": self.name,
             "rssi": self.rssi,
@@ -1417,11 +1853,45 @@ class Device:
             "previous_distance": getattr(self, "previous_distance", None),
             "distance_trend": serializable_trend,
             "last_trend_update": getattr(self, "last_trend_update", 0),
+            # Include AirTag detection properties based on Adam Catley's research
+            "previous_seen": getattr(self, "previous_seen", None),
+            "adv_interval": getattr(self, "adv_interval", None),
+            "adv_interval_history": adv_interval_history,
+            "consistent_airtag_interval": getattr(
+                self, "consistent_airtag_interval", False
+            ),
+            "adv_changes": getattr(self, "adv_changes", 0),
+            "last_adv_change_time": getattr(self, "last_adv_change_time", None),
+            "prev_adv_change_time": getattr(self, "prev_adv_change_time", None),
+            "adv_change_interval": getattr(self, "adv_change_interval", None),
+            "matches_airtag_timing": getattr(self, "matches_airtag_timing", False),
+            "apple_adv_type": getattr(self, "apple_adv_type", None),
+            "find_my_uuid": getattr(self, "find_my_uuid", None),
+            "find_my_service_data": getattr(self, "find_my_service_data", None),
+            "airtag_status": getattr(self, "airtag_status", {}),
+            # New AirTag detection properties
+            "unregistered_airtag": getattr(self, "unregistered_airtag", False),
+            "battery_status": getattr(self, "battery_status", None),
+            "crypto_counter": getattr(self, "crypto_counter", None),
+            "crypto_counter_time": getattr(self, "crypto_counter_time", None),
+            "crypto_counter_matches": getattr(self, "crypto_counter_matches", False),
         }
+
+        # If we have stored the last advertisement data, convert it to a serializable format
+        if hasattr(self, "last_advertisement_data"):
+            result["last_advertisement_data"] = list(self.last_advertisement_data)
+
+        # Convert previous manufacturer data to serializable format if available
+        if hasattr(self, "prev_manufacturer_data"):
+            result["prev_manufacturer_data"] = {
+                str(k): list(v) for k, v in self.prev_manufacturer_data.items()
+            }
+
+        return result
 
     @classmethod
     def from_dict(cls, data: Dict) -> "Device":
-        """Create device from dictionary"""
+        """Create device from dictionary including AirTag detection properties"""
         device = cls(
             address=data["address"],
             name=data["name"],
@@ -1466,6 +1936,79 @@ class Device:
                     except (KeyError, TypeError):
                         # Skip malformed entries
                         continue
+
+        # Restore AirTag detection properties from Adam Catley's research
+        if "previous_seen" in data:
+            device.previous_seen = data["previous_seen"]
+
+        if "adv_interval" in data:
+            device.adv_interval = data["adv_interval"]
+
+        if "adv_interval_history" in data and isinstance(
+            data["adv_interval_history"], list
+        ):
+            device.adv_interval_history = deque(data["adv_interval_history"], maxlen=10)
+
+        if "consistent_airtag_interval" in data:
+            device.consistent_airtag_interval = data["consistent_airtag_interval"]
+
+        if "adv_changes" in data:
+            device.adv_changes = data["adv_changes"]
+
+        if "last_adv_change_time" in data:
+            device.last_adv_change_time = data["last_adv_change_time"]
+
+        if "prev_adv_change_time" in data:
+            device.prev_adv_change_time = data["prev_adv_change_time"]
+
+        if "adv_change_interval" in data:
+            device.adv_change_interval = data["adv_change_interval"]
+
+        if "matches_airtag_timing" in data:
+            device.matches_airtag_timing = data["matches_airtag_timing"]
+
+        if "apple_adv_type" in data:
+            device.apple_adv_type = data["apple_adv_type"]
+
+        if "find_my_uuid" in data:
+            device.find_my_uuid = data["find_my_uuid"]
+
+        if "find_my_service_data" in data:
+            device.find_my_service_data = data["find_my_service_data"]
+
+        if "airtag_status" in data and isinstance(data["airtag_status"], dict):
+            device.airtag_status = data["airtag_status"]
+
+        # Restore new AirTag detection properties
+        if "unregistered_airtag" in data:
+            device.unregistered_airtag = data["unregistered_airtag"]
+
+        if "battery_status" in data:
+            device.battery_status = data["battery_status"]
+
+        if "crypto_counter" in data:
+            device.crypto_counter = data["crypto_counter"]
+
+        if "crypto_counter_time" in data:
+            device.crypto_counter_time = data["crypto_counter_time"]
+
+        if "crypto_counter_matches" in data:
+            device.crypto_counter_matches = data["crypto_counter_matches"]
+
+        # Restore last advertisement data if available
+        if "last_advertisement_data" in data and isinstance(
+            data["last_advertisement_data"], list
+        ):
+            device.last_advertisement_data = bytes(data["last_advertisement_data"])
+
+        # Restore previous manufacturer data if available
+        if "prev_manufacturer_data" in data and isinstance(
+            data["prev_manufacturer_data"], dict
+        ):
+            device.prev_manufacturer_data = {
+                int(k): bytes(v)
+                for k, v in data.get("prev_manufacturer_data", {}).items()
+            }
 
         return device
 
