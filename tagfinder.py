@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import copy
 import json
 import math
 import os
@@ -1880,7 +1881,19 @@ class TagFinder:
             sorted_devices = filtered_devices
 
         # Store sorted list for tab-based selection
-        self.sorted_device_list = sorted_devices
+        # This sorted_device_list is used for tab navigation in selection mode
+        # We need to make sure it's consistent with our frozen device list if we're in selection mode
+        if (
+            hasattr(self, "selection_mode")
+            and self.selection_mode
+            and hasattr(self, "frozen_devices")
+        ):
+            # When in selection mode, we should use the same sorting but on frozen devices
+            # to ensure consistent tab navigation
+            frozen_sorted = sorted(self.frozen_devices.values(), key=multi_sort_key)
+            self.sorted_device_list = frozen_sorted
+        else:
+            self.sorted_device_list = sorted_devices
 
         # Reset device map for this display
         device_map = {}
@@ -1970,6 +1983,13 @@ class TagFinder:
                 style = "on green"
                 # Map the cursor position to this device for easy selection with Enter
                 self.cursor_device = device.address
+                # Also store the current cursor position's device for consistency
+                if hasattr(self, "frozen_devices"):
+                    # Ensure the cursor_device comes from frozen_devices in selection mode
+                    frozen_devices_list = list(self.frozen_devices.values())
+                    if 0 <= self.cursor_position < len(frozen_devices_list):
+                        frozen_device = frozen_devices_list[self.cursor_position]
+                        self.cursor_device = frozen_device.address
 
             # Display detailed information without the seen time
             details = device.device_details if device.device_details else ""
@@ -3126,6 +3146,10 @@ class TagFinder:
 
     async def discovery_callback(self, device, advertisement_data):
         """Callback for BleakScanner when a device is discovered"""
+        # Skip updates when in selection mode to prevent table movement
+        if hasattr(self, "selection_mode") and self.selection_mode:
+            return
+
         # Check if this is a new device for this scanning session
         is_new_device = device.address not in self.devices
 
@@ -3930,6 +3954,9 @@ class TagFinder:
             self.selected_device = None
             self.input_buffer = ""  # Clear input buffer
             self.selection_mode = False
+            # Clean up frozen devices when exiting selection mode
+            if hasattr(self, "frozen_devices"):
+                del self.frozen_devices
         elif key == "t":  # Enter tab selection mode
             self.selection_mode = True
             self.cursor_position = 0
@@ -3946,6 +3973,9 @@ class TagFinder:
             if self.selection_mode and hasattr(self, "cursor_device"):
                 self.selected_device = self.cursor_device
                 self.selection_mode = False
+                # Clean up frozen devices when exiting selection mode
+                if hasattr(self, "frozen_devices"):
+                    del self.frozen_devices
         # Column visibility toggle keys
         elif key == "c":  # Toggle type column
             self.visible_columns["type"] = not self.visible_columns.get("type", True)
@@ -4020,6 +4050,9 @@ class TagFinder:
                     # Clear buffer only after successful selection
                     self.input_buffer = ""
                     self.selection_mode = False
+                    # Clean up frozen devices when exiting selection mode
+                    if hasattr(self, "frozen_devices"):
+                        del self.frozen_devices
             except ValueError:
                 # Invalid buffer content
                 pass
@@ -4029,6 +4062,19 @@ class TagFinder:
         if self.scanning:
             # Create scanning-specific layout
             scanning_layout = Layout()
+
+            # Store a snapshot of devices when entering selection mode
+            if (
+                hasattr(self, "selection_mode")
+                and self.selection_mode
+                and not hasattr(self, "frozen_devices")
+            ):
+                self.frozen_devices = copy.deepcopy(self.devices)
+            # Clear frozen devices when exiting selection mode
+            elif hasattr(self, "frozen_devices") and not (
+                hasattr(self, "selection_mode") and self.selection_mode
+            ):
+                del self.frozen_devices
 
             # Create a combined control and settings panel for the header
             airtag_mode = "[green]ON[/]" if self.airtag_only_mode else "[red]OFF[/]"
@@ -4046,8 +4092,12 @@ class TagFinder:
                 range_color = "blue"
 
             # Calculate scan duration if we've been scanning
+            # Use frozen devices for time calculations when in selection mode
+            devices_to_use = (
+                self.frozen_devices if hasattr(self, "frozen_devices") else self.devices
+            )
             scan_time = time.time() - min(
-                [d.first_seen for d in self.devices.values()], default=time.time()
+                [d.first_seen for d in devices_to_use.values()], default=time.time()
             )
             scan_duration = f"[bold green]{scan_time:.1f}s[/]"
             device_count = len(self.devices)
@@ -4446,8 +4496,14 @@ class TagFinder:
                 )
 
                 scanning_layout["controls"].update(top_panel)
+                # Use frozen devices in selection mode to keep table from moving
+                devices_to_display = (
+                    self.frozen_devices
+                    if hasattr(self, "frozen_devices")
+                    else self.devices
+                )
                 scanning_layout["devices"].update(
-                    self.generate_device_table(self.devices)
+                    self.generate_device_table(devices_to_display)
                 )
 
             return scanning_layout
@@ -4463,7 +4519,13 @@ class TagFinder:
             )
 
             # Update devices table with responsive layout
-            self.layout["devices"].update(self.generate_device_table(self.devices))
+            # Use frozen devices in selection mode to keep table from moving
+            devices_to_display = (
+                self.frozen_devices if hasattr(self, "frozen_devices") else self.devices
+            )
+            self.layout["devices"].update(
+                self.generate_device_table(devices_to_display)
+            )
 
             # The footer now might return a Layout object instead of a Panel if in split mode
             status_panel = self.generate_status_panel()
