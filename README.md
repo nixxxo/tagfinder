@@ -191,7 +191,7 @@ This project builds upon research in Bluetooth tracking device protocols:
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE.md) file for details.
 
 ## 🤝 Contributing
 
