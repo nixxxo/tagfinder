@@ -2,13 +2,15 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
-A powerful Bluetooth scanner with specialized capabilities for detecting and analyzing tracking devices, particularly Apple AirTags and other Find My network accessories.
+A Bluetooth scanner with specialized capabilities for detecting and analyzing tracking devices, particularly Apple AirTags and other Find My network accessories.
 
-## 📋 Overview
+> Shared as a reference. Not actively maintained for external contributions.
+
+## Overview
 
 TagFinder is a terminal-based interactive application that provides enhanced detection and analysis of Bluetooth Low Energy (BLE) devices, with a particular focus on identifying potentially unwanted tracking devices. The application uses advanced techniques to detect, analyze, and monitor BLE devices in your vicinity, providing detailed information about each detected device.
 
-## 🔍 Key Features
+## Key Features
 
 -   **Advanced Tracking Device Detection**: Specialized algorithms to identify Apple AirTags, Find My accessories, and other Bluetooth trackers
 -   **Real-time Distance Estimation**: Calculate approximate distance to detected devices with calibration capabilities
@@ -18,7 +20,7 @@ TagFinder is a terminal-based interactive application that provides enhanced det
 -   **Interactive Interface**: Rich terminal UI with filtering, sorting, and device inspection capabilities
 -   **Cross-platform Support**: Works on macOS, Linux, and Windows
 
-## 🎯 Special AirTag Detection Capabilities
+## Special AirTag Detection Capabilities
 
 TagFinder implements detection techniques based on reverse engineering research of the Apple Find My protocol:
 
@@ -30,11 +32,11 @@ TagFinder implements detection techniques based on reverse engineering research 
 -   **Registration Status**: Identifies unregistered AirTags (advertising with 0x07 type)
 -   **Confidence Scoring**: Calculates a probability score for tracker identification
 
-## 🚀 Installation
+## Installation
 
 ### Prerequisites
 
--   Python 3.7 or higher
+-   Python 3.8 or higher
 -   Bluetooth adapter with BLE support
 -   Administrator/sudo privileges (for certain Bluetooth operations)
 
@@ -76,7 +78,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 💻 Usage
+## Usage
 
 ### Starting the Application
 
@@ -97,6 +99,11 @@ python tagfinder.py
 | `m` | Test maximum adapter range                                 |
 | `l` | List Bluetooth adapters                                    |
 | `z` | Analyze & Summarize findings                               |
+| `t` | Select a device (freezes the list while selecting)         |
+| `b` | Back: clear the selection                                  |
+| `p` | Toggle the tracker-probability column                      |
+| `f` | Toggle the manufacturer column                             |
+| `i` | Toggle the details column                                  |
 | `q` | Quit                                                       |
 
 ### Interface Sections
@@ -109,7 +116,7 @@ The application has a multi-pane interface with:
 -   **Status Bar**: Current scanning status and application mode indicators
 -   **Control Panel**: Available keyboard commands
 
-## ⚙️ Platform-Specific Setup
+## Platform-Specific Setup
 
 ### Linux
 
@@ -138,7 +145,7 @@ sudo usermod -a -G bluetooth $USER
 -   The application may require permission to access Bluetooth when first run
 -   For full functionality, authorize the terminal application in System Preferences > Security & Privacy > Privacy > Bluetooth
 
-## 🔧 Configuration
+## Configuration
 
 TagFinder stores its configuration in `settings.json`, which includes:
 
@@ -148,7 +155,7 @@ TagFinder stores its configuration in `settings.json`, which includes:
 -   Scanning parameters (range mode, duration, detection threshold)
 -   Selected Bluetooth adapter
 
-## 🔒 Privacy & Security
+## Privacy & Security
 
 TagFinder is designed as a security tool to help users detect unwanted tracking devices. When using this tool:
 
@@ -157,7 +164,7 @@ TagFinder is designed as a security tool to help users detect unwanted tracking 
 -   Device history is stored in a local file (`devices_history.json`)
 -   The application does not modify any detected Bluetooth devices
 
-## 🔄 Advanced Usage
+## Advanced Usage
 
 ### Calibration Mode
 
@@ -183,16 +190,12 @@ If you have multiple Bluetooth adapters:
 2. Select the adapter you wish to use
 3. The application will restart using the selected adapter
 
-## 📚 References
+## References
 
 This project builds upon research in Bluetooth tracking device protocols:
 
 1. [Adam Catley's AirTag Reverse Engineering](https://adamcatley.com/AirTag.html)
 
-## 📄 License
+## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE.md) file for details.
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
