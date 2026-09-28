@@ -1,201 +1,74 @@
 # TagFinder
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
+A terminal Bluetooth LE scanner for spotting unwanted trackers: it identifies Apple AirTags and other Find My accessories from their advertisements, decodes their status and battery bits, and estimates distance and movement.
 
-A Bluetooth scanner with specialized capabilities for detecting and analyzing tracking devices, particularly Apple AirTags and other Find My network accessories.
+Built on published reverse-engineering of the Find My protocol ([Adam Catley's AirTag research](https://adamcatley.com/AirTag.html)).
 
 > Shared as a reference. Not actively maintained for external contributions.
 
-## Overview
+## What it does
 
-TagFinder is a terminal-based interactive application that provides enhanced detection and analysis of Bluetooth Low Energy (BLE) devices, with a particular focus on identifying potentially unwanted tracking devices. The application uses advanced techniques to detect, analyze, and monitor BLE devices in your vicinity, providing detailed information about each detected device.
+| Area | Details |
+|---|---|
+| Tracker identification | Find My advertisement patterns, a tracker-probability score per device, unregistered AirTags (advertisement type `0x07`) |
+| AirTag state | status bits for Separated, Play Sound and Lost Mode; battery level (Full, Medium, Low, Very Low) |
+| Behaviour over time | the roughly 2 s advertising interval, the 15-minute key rotation, proximity trend and movement history |
+| Distance | log-distance path-loss estimate from RSSI (defaults: −59 dBm at 1 m, n = 2.0), with a calibration mode |
+| Device details | manufacturer (company ID), advertisement data, services, first and last seen |
+| Adapters | list and switch Bluetooth adapters, adaptive scanning, a maximum-range test |
 
-## Key Features
+Everything runs locally. Nothing is sent over the network, and the tool never connects to or modifies the devices it sees.
 
--   **Advanced Tracking Device Detection**: Specialized algorithms to identify Apple AirTags, Find My accessories, and other Bluetooth trackers
--   **Real-time Distance Estimation**: Calculate approximate distance to detected devices with calibration capabilities
--   **Movement Analysis**: Track device movements with proximity trend analysis and movement history
--   **Comprehensive Device Information**: Detailed breakdown of device attributes, advertisement data, and manufacturer information
--   **Multi-adapter Support**: Use and test multiple Bluetooth adapters for increased range and detection capabilities
--   **Interactive Interface**: Rich terminal UI with filtering, sorting, and device inspection capabilities
--   **Cross-platform Support**: Works on macOS, Linux, and Windows
+## Quickstart
 
-## Special AirTag Detection Capabilities
-
-TagFinder implements detection techniques based on reverse engineering research of the Apple Find My protocol:
-
--   **Protocol Pattern Detection**: Identifies characteristic Find My advertisement patterns
--   **Status Bit Analysis**: Reads AirTag status bits to determine if devices are in Separated, Play Sound, or Lost Mode
--   **Interval Monitoring**: Tracks the characteristic 2-second advertisement intervals of AirTags
--   **Crypto Counter Tracking**: Monitors the 15-minute advertisement data update cycles
--   **Battery Level Detection**: Determines AirTag battery level (Full, Medium, Low, Very Low)
--   **Registration Status**: Identifies unregistered AirTags (advertising with 0x07 type)
--   **Confidence Scoring**: Calculates a probability score for tracker identification
-
-## Installation
-
-### Prerequisites
-
--   Python 3.8 or higher
--   Bluetooth adapter with BLE support
--   Administrator/sudo privileges (for certain Bluetooth operations)
-
-### Setup Steps
-
-1. **Clone the repository**
+Requires Python 3.8+ and a Bluetooth adapter with BLE.
 
 ```bash
 git clone https://github.com/nixxxo/tagfinder.git
 cd tagfinder
-```
-
-2. **Create a virtual environment**
-
-```bash
-# On Windows
-python -m venv venv
-
-# On macOS/Linux
-python3 -m venv venv
-```
-
-3. **Activate the virtual environment**
-
-```bash
-# On Windows (Command Prompt)
-venv\Scripts\activate.bat
-
-# On Windows (PowerShell)
-.\venv\Scripts\Activate.ps1
-
-# On macOS/Linux
-source venv/bin/activate
-```
-
-4. **Install dependencies**
-
-```bash
+python3 -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-## Usage
-
-### Starting the Application
-
-```bash
-# With virtual environment activated
 python tagfinder.py
 ```
 
-### Keyboard Controls
+Platform notes:
 
-| Key | Function                                                   |
-| --- | ---------------------------------------------------------- |
-| `s` | Start/Stop scanning                                        |
-| `a` | Toggle Find My mode (focus on AirTags and Find My devices) |
-| `d` | Toggle adaptive mode                                       |
-| `c` | Toggle calibration mode                                    |
-| `r` | Configure scan range                                       |
-| `m` | Test maximum adapter range                                 |
-| `l` | List Bluetooth adapters                                    |
-| `z` | Analyze & Summarize findings                               |
-| `t` | Select a device (freezes the list while selecting)         |
-| `b` | Back: clear the selection                                  |
-| `p` | Toggle the tracker-probability column                      |
-| `f` | Toggle the manufacturer column                             |
-| `i` | Toggle the details column                                  |
-| `q` | Quit                                                       |
+- **macOS**: allow your terminal under System Settings → Privacy & Security → Bluetooth.
+- **Linux**: `sudo apt install bluetooth bluez`, then either add your user to the `bluetooth` group or grant the interpreter raw-socket access: `sudo setcap 'cap_net_raw,cap_net_admin+eip' "$(readlink -f "$(which python3)")"`.
+- **Windows**: Bluetooth on, current drivers; run as administrator if scanning is denied.
 
-### Interface Sections
+### Controls
 
-The application has a multi-pane interface with:
+| Key | Action |
+|---|---|
+| `s` | start or stop scanning |
+| `a` | Find My mode (AirTags and Find My devices only) |
+| `d` | adaptive mode |
+| `c` | calibration mode (place a device at exactly 1 m) |
+| `r` | scan range |
+| `m` | maximum adapter range test |
+| `l` | list and select adapters |
+| `z` | analyse and summarise findings |
+| `t` | select a device (freezes the list while selecting) |
+| `b` | back: clear the selection |
+| `p` / `f` / `i` | toggle the tracker-probability / manufacturer / details column |
+| `q` | quit |
 
--   **Header**: Application title and status information
--   **Device List**: Table of detected Bluetooth devices with sortable columns
--   **Details Panel**: Comprehensive information about the selected device
--   **Status Bar**: Current scanning status and application mode indicators
--   **Control Panel**: Available keyboard commands
+## Architecture
 
-## Platform-Specific Setup
+A single script, `tagfinder.py`, on top of [bleak](https://github.com/hbldh/bleak) (cross-platform BLE) and [rich](https://github.com/Textualize/rich) (terminal UI).
 
-### Linux
+| Component | Responsibility |
+|---|---|
+| `Device` | per-device state: RSSI history, advertisement parsing, Find My and AirTag decoding, distance and movement |
+| `TagFinder` | scanner lifecycle, adapter handling, settings, keyboard input and the live multi-pane display |
 
-Linux requires additional permissions to access Bluetooth hardware:
-
-```bash
-# Install required packages
-sudo apt-get install bluetooth bluez libbluetooth-dev
-
-# Grant Python permission to access raw Bluetooth sockets
-sudo setcap 'cap_net_raw,cap_net_admin+eip' $(which python3)
-
-# Alternative: Add your user to the bluetooth group
-sudo usermod -a -G bluetooth $USER
-```
-
-### Windows
-
--   Ensure Bluetooth is enabled in Windows Settings
--   Run the application with administrator privileges if having permission issues
--   Latest Bluetooth drivers should be installed for optimal performance
-
-### macOS
-
--   Ensure Bluetooth is enabled in System Preferences
--   The application may require permission to access Bluetooth when first run
--   For full functionality, authorize the terminal application in System Preferences > Security & Privacy > Privacy > Bluetooth
+On Linux, passive scanning uses BlueZ advertisement monitors; macOS and Windows use their native backends through bleak.
 
 ## Configuration
 
-TagFinder stores its configuration in `settings.json`, which includes:
-
--   Filter preferences (AirTag-only mode)
--   Sort priority for device listing
--   Visible columns in the device table
--   Scanning parameters (range mode, duration, detection threshold)
--   Selected Bluetooth adapter
-
-## Privacy & Security
-
-TagFinder is designed as a security tool to help users detect unwanted tracking devices. When using this tool:
-
--   All data is processed locally on your device
--   No device information is transmitted to remote servers
--   Device history is stored in a local file (`devices_history.json`)
--   The application does not modify any detected Bluetooth devices
-
-## Advanced Usage
-
-### Calibration Mode
-
-For more accurate distance estimation, you can calibrate the application:
-
-1. Place a known Bluetooth device at exactly 1 meter from your device
-2. Enter calibration mode with the `c` key
-3. Select the device and follow the calibration prompts
-
-### Range Testing
-
-Test the maximum range of your Bluetooth adapter:
-
-1. Press `m` to enter range testing mode
-2. Position a Bluetooth device at increasing distances
-3. The application will report signal strength at each distance
-
-### Adapter Selection
-
-If you have multiple Bluetooth adapters:
-
-1. Press `l` to list available adapters
-2. Select the adapter you wish to use
-3. The application will restart using the selected adapter
-
-## References
-
-This project builds upon research in Bluetooth tracking device protocols:
-
-1. [Adam Catley's AirTag Reverse Engineering](https://adamcatley.com/AirTag.html)
+Settings are saved to `settings.json` in the working directory: AirTag-only filter, sort priority, visible columns, scan range and parameters, and the selected adapter. Device history goes to `devices_history.json`. Both are gitignored.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT: see [LICENSE](LICENSE).
