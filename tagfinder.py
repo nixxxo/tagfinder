@@ -23,8 +23,11 @@ from rich.layout import Layout
 from rich.box import ROUNDED, HEAVY, SIMPLE
 from rich import box
 
-# Import OrPattern for passive scanning on Linux
-from bleak.backends.bluezdbus.advertisement_monitor import OrPattern
+# OrPattern is BlueZ-only (Linux passive scanning); the backend fails to import elsewhere
+try:
+    from bleak.backends.bluezdbus.advertisement_monitor import OrPattern
+except ImportError:
+    OrPattern = None
 from bleak.assigned_numbers import AdvertisementDataType
 
 
@@ -4014,7 +4017,7 @@ class TagFinder:
             OrPattern(
                 0, AdvertisementDataType.COMPLETE_LOCAL_NAME, b"\x00"
             ),  # Match any name
-        ]
+        ] if OrPattern else []
 
         # Display scanning parameters
         self.console.print(
@@ -5508,7 +5511,7 @@ class TagFinder:
             OrPattern(
                 0, AdvertisementDataType.COMPLETE_LOCAL_NAME, b"\x00"
             ),  # Match any name
-        ]
+        ] if OrPattern else []
 
         # Set up the test panel based on which mode we're in
         if advanced_mode:
