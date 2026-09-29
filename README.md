@@ -24,7 +24,7 @@ Everything runs locally. Nothing is sent over the network, and the tool never co
 Requires Python 3.8+ and a Bluetooth adapter with BLE.
 
 ```bash
-git clone https://github.com/nixxxo/tagfinder.git
+git clone https://github.com/nbaburov/tagfinder.git
 cd tagfinder
 python3 -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
