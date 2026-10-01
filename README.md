@@ -71,4 +71,4 @@ Settings are saved to `settings.json` in the working directory: AirTag-only filt
 
 ## License
 
-MIT: see [LICENSE](LICENSE).
+[PolyForm Noncommercial 1.0.0](LICENSE): free for any noncommercial use with attribution. Commercial use needs a separate paid license; contact [NB Limited](https://nb-limited.com).
